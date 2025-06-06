@@ -1,41 +1,34 @@
-<<<<<<< HEAD
-# Shadowrun Flask Backend
+# Shadowrun Backend
 
-The backend API for the Shadowrun Multiplayer Engine. Provides session management, user roles, persistent chat memory, command routing, and real-time AI streaming for collaborative Shadowrun RPG sessions.
-
----
-
-## Inhaltsverzeichnis / Table of Contents
-- [Überblick / Overview](#überblick--overview)
-- [Architektur / Architecture](#architektur--architecture)
-- [Funktionen / Features](#funktionen--features)
-- [Schnellstart / Quickstart](#schnellstart--quickstart)
-- [API-Referenz / API Reference](#api-referenz--api-reference)
-- [Session Memory & Streaming](#session-memory--streaming)
-- [Erweiterbarkeit / Extensibility](#erweiterbarkeit--extensibility)
-- [Fehlerbehebung / Troubleshooting](#fehlerbehebung--troubleshooting)
-- [Roadmap](#roadmap)
-- [Lizenz / License](#lizenz--license)
+A Python Flask API powering the Shadowrun character creation system and multiplayer engine. Supports character data management, rules enforcement, skill/equipment/magic systems, session management, and real-time AI integration. Implements Shadowrun 6E rules with SQLite persistence and RESTful endpoints.
 
 ---
 
-## Überblick / Overview
-
-- **Python 3.13 Flask backend** for the Shadowrun Multiplayer Engine
-- Provides RESTful API for session, user, and entity management
-- Persistent chat memory per session/user/role
-- Real-time streaming AI output (OpenAI, Mistral, etc.) via httpx
-- SQLite storage, CORS enabled
+## Table of Contents
+- [Overview](#overview)
+- [Architecture](#architecture)
+- [Features](#features)
+- [API Reference](#api-reference)
+- [Setup](#setup)
+- [Extensibility](#extensibility)
+- [License](#license)
 
 ---
 
-## Architektur / Architecture
+## Overview
+
+Shadowrun Backend is a Python Flask API designed to power the Shadowrun character creation system and multiplayer engine. It provides a robust set of features to support character data management, rules enforcement, skill/equipment/magic systems, session management, and real-time AI integration.
+
+---
+
+## Architecture
 
 ```
 shadowrun-backend/
 ├── app.py            # Main Flask app
+├── character/        # Character creation modules
 ├── llm_utils.py      # Async OpenAI/LLM utilities
-├── stream_proxy.py   # SSE proxy for frontend EventSource
+├── stream_proxy.py   # SSE proxy for EventSource
 ├── .env              # Environment variables
 ├── requirements.txt  # Python dependencies
 └── ...
@@ -43,22 +36,48 @@ shadowrun-backend/
 
 ---
 
-## Funktionen / Features
-- **Session Management:** Create, join, and list multiplayer sessions
-- **User Roles:** Player, GM, Observer (with role-based permissions)
-- **Command Routing:** API endpoints for specialized Shadowrun commands
-- **Persistent Memory:** Chat history per session/user/role
-- **Streaming:** Real-time AI output using SSE
-- **CORS:** Enabled by default
-- **Extensible:** Add new endpoints for Shadowrun-specific logic
+## Features
+
+### Character Creation
+- Enforces Shadowrun 6E rules
+- Skill, equipment, and magic systems
+- Validates character sheets
+
+### Multiplayer
+- Session management (create/join/list)
+- Player, GM, Observer roles
+- Command routing for Shadowrun commands
+- Persistent chat memory
+- Real-time AI output (SSE)
+- Extensible endpoints
 
 ---
 
-## Schnellstart / Quickstart
+## API Reference
 
-### Voraussetzungen / Prerequisites
-- Python 3.13+
-- OpenAI API key (or other LLM provider)
+### Character Creation
+- `GET /api/data/metatypes` — List metatypes
+- `GET /api/data/skills` — List skills
+- `POST /api/character/validate` — Validate character sheet
+- `POST /api/character/save` — Save character
+
+### Multiplayer
+- `POST /api/session` — Create session
+- `POST /api/session/<session_id>/join` — Join session
+- `GET /api/session/<session_id>/users` — List users
+- `GET/POST /api/session/<session_id>/scene` — Manage scene
+- `GET/POST /api/session/<session_id>/entities` — Entity tracker
+- `POST /api/chat` — AI chat
+- `GET /api/chat/stream-proxy` — SSE proxy
+- `GET /api/ping` — Health check
+
+---
+
+## Setup
+
+### Prerequisites
+- Python 3.8+
+- OpenAI API key (for AI features)
 
 ### Installation & Start
 ```sh
@@ -69,107 +88,15 @@ python app.py
 
 ---
 
-## API-Referenz / API Reference
+## Extensibility
 
-- `POST /api/session` — Create a new session
-- `POST /api/session/<session_id>/join` — Join a session
-- `GET /api/session/<session_id>/users` — List users in a session
-- `GET/POST /api/session/<session_id>/scene` — Manage scene summaries
-- `GET/POST /api/session/<session_id>/entities` — Entity tracker
-- `POST /api/chat` — AI chat (session memory, streaming)
-- `GET /api/chat/stream-proxy` — SSE proxy for frontend
-- `GET /api/ping` — Health check
-
-See [shadowrun-interface/README.md](../shadowrun-interface/README.md) for frontend usage.
+- Add Flask endpoints for custom logic
+- Integrate new LLM providers in `llm_utils.py`
+- Extend database models
+- Add new character modules
 
 ---
 
-## Session Memory & Streaming
-- **ChatMemory** table stores message history for each session/user/role
-- AI responses use full session context
-- Streaming output via Server-Sent Events (SSE)
+## License
 
----
-
-## Erweiterbarkeit / Extensibility
-- Add new Flask endpoints for custom Shadowrun logic
-- Integrate additional LLM providers in `llm_utils.py`
-- Extend database models as needed
-
----
-
-## Fehlerbehebung / Troubleshooting
-- **CORS:** Ensure frontend and backend are on correct ports
-- **API Keys:** Set your OpenAI key in `.env`
-- **Streaming:** If streaming fails, check `/api/chat/stream-proxy` and backend logs
-- **DB:** Delete `shadowrun.db` to reset sessions (dev only)
-
----
-
-## Roadmap
-- Advanced dice roll logic (Shadowrun glitches)
-- GM override panel for AI output
-- Clerk authentication integration
-- More RPG command endpoints
-
----
-
-## Lizenz / License
-MIT License. Shadowrun is a registered trademark of Catalyst Game Labs. This project is a fan work and not affiliated with or endorsed by the copyright holders.
-
----
-
-# Shadowrun Flask Backend (Deutsch)
-
-Das Backend-API für die Shadowrun Multiplayer Engine. Bietet Sitzungsverwaltung, Benutzerrollen, persistente Chat-Speicherung, Kommando-Routing und Echtzeit-AI-Streaming für kollaborative Shadowrun-RPG-Sitzungen.
-
-## Architektur
-- Python 3.13 Flask Backend
-- RESTful API für Sitzungen, Benutzer und Entitäten
-- Persistente Chat-Speicherung pro Sitzung/Benutzer/Rolle
-- Echtzeit-Streaming von KI-Ausgaben (OpenAI, Mistral, etc.) via httpx
-- SQLite-Speicherung, CORS aktiviert
-
-## Funktionen
-- Sitzungsverwaltung: Erstellen, Beitreten, Auflisten von Multiplayer-Sitzungen
-- Benutzerrollen: Spieler, GM, Beobachter (mit rollenbasierten Berechtigungen)
-- Kommando-Routing: API-Endpunkte für Shadowrun-spezifische Kommandos
-- Persistente Speicherung: Chatverlauf pro Sitzung/Benutzer/Rolle
-- Streaming: Echtzeit-KI-Ausgabe via SSE
-- CORS: Standardmäßig aktiviert
-- Erweiterbar: Neue Endpunkte für Shadowrun-Logik hinzufügen
-
-## Schnellstart
-1. Python 3.13+ installieren
-2. Abhängigkeiten installieren: `pip install -r requirements.txt`
-3. `.env.example` kopieren und API-Key setzen
-4. Backend starten: `python app.py`
-
-## API-Endpunkte
-- `POST /api/session` — Neue Sitzung erstellen
-- `POST /api/session/<session_id>/join` — Sitzung beitreten
-- `GET /api/session/<session_id>/users` — Benutzer in Sitzung auflisten
-- `GET/POST /api/session/<session_id>/scene` — Szenenzusammenfassung verwalten
-- `GET/POST /api/session/<session_id>/entities` — Entitäten-Tracker
-- `POST /api/chat` — AI-Chat (Sitzungsspeicher, Streaming)
-- `GET /api/chat/stream-proxy` — SSE-Proxy für Frontend
-- `GET /api/ping` — Health Check
-
-## Fehlerbehebung
-- CORS-Probleme: Ports prüfen
-- API-Key: In `.env` setzen
-- Streaming-Probleme: `/api/chat/stream-proxy` und Backend-Logs prüfen
-- Datenbank: `shadowrun.db` löschen, um Sitzungen zurückzusetzen (nur Entwicklung)
-
-## Roadmap
-- Erweiterte Würfellogik (Shadowrun Glitches)
-- GM-Override-Panel für KI-Ausgaben
-- Clerk-Authentifizierung
-- Weitere RPG-Kommando-Endpunkte
-
-## Lizenz
-MIT License. Shadowrun ist ein eingetragenes Warenzeichen von Catalyst Game Labs. Dieses Projekt ist ein Fanprojekt und steht in keiner Verbindung zu den Rechteinhabern.
-=======
-# shadowrun-backend
-Flask-based API service powering the Shadowrun character creation system. Features include character data management, rule enforcement, skill calculation, equipment tracking, and spell systems. Implements comprehensive 6th Edition ruleset with SQLite persistence and RESTful endpoints for seamless frontend integration.
->>>>>>> 00baf9f313d4d30d8c4c8d5b5bdbd95b89a317f3
+MIT License. Shadowrun is a trademark of Catalyst Game Labs. This project is a fan work and not affiliated with or endorsed by the copyright holders.
