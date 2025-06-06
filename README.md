@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Shadowrun Flask Backend
 
 The backend API for the Shadowrun Multiplayer Engine. Provides session management, user roles, persistent chat memory, command routing, and real-time AI streaming for collaborative Shadowrun RPG sessions.
@@ -168,3 +169,7 @@ Das Backend-API für die Shadowrun Multiplayer Engine. Bietet Sitzungsverwaltung
 
 ## Lizenz
 MIT License. Shadowrun ist ein eingetragenes Warenzeichen von Catalyst Game Labs. Dieses Projekt ist ein Fanprojekt und steht in keiner Verbindung zu den Rechteinhabern.
+=======
+# shadowrun-backend
+Flask-based API service powering the Shadowrun character creation system. Features include character data management, rule enforcement, skill calculation, equipment tracking, and spell systems. Implements comprehensive 6th Edition ruleset with SQLite persistence and RESTful endpoints for seamless frontend integration.
+>>>>>>> 00baf9f313d4d30d8c4c8d5b5bdbd95b89a317f3
