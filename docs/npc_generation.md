@@ -1,0 +1,176 @@
+# NPC Generation System
+
+## NPC Type Classification
+
+### Archetypes
+- **Street**: Gangers, Fixers, Black Market Dealers
+- **Corporate**: Security, Executives, Scientists
+- **Shadow**: Runners, Mercenaries, Specialists
+- **Magical**: Shamans, Mages, Adepts
+- **Matrix**: Deckers, Technomancers, IC
+
+### Power Levels
+- **Mook**: Basic opposition, minimal customization
+- **Lieutenant**: Enhanced capabilities, some special abilities
+- **Prime Runner**: High-power NPCs with extensive customization
+- **Legendary**: Story-critical characters with unique abilities
+
+## Data Model Extension
+
+```python
+class NPCTemplate(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String, nullable=False)
+    archetype = db.Column(db.String, nullable=False)
+    power_level = db.Column(db.String, nullable=False)
+    attribute_priorities = db.Column(db.Text, nullable=False)  # JSON: priority order for attributes
+    skill_groups = db.Column(db.Text, nullable=False)  # JSON: skill groups with weights
+    equipment_categories = db.Column(db.Text, nullable=False)  # JSON: equipment categories with weights
+    personality_traits = db.Column(db.Text, nullable=False)  # JSON: possible traits and weights
+    motivations = db.Column(db.Text, nullable=False)  # JSON: possible motivations and weights
+```
+
+## Generation Algorithm
+
+The NPC generator uses weighted randomization based on archetype and power level:
+
+1. **Select Template**: Choose appropriate template based on NPC type and power level
+2. **Generate Attributes**: Allocate points based on template priorities and power level
+3. **Assign Skills**: Allocate skill points based on template skill groups
+4. **Select Equipment**: Choose gear based on power level budget and template weights
+5. **Generate Personality**: Randomly select personality traits and motivations
+6. **Create Narrative Hooks**: Generate plot hooks based on personality and background
+
+## Usage in API
+
+```python
+@app.route('/api/session/<session_id>/npc/generate', methods=['POST'])
+def generate_npc(session_id):
+    """
+    Generate an NPC based on request parameters
+    
+    Request JSON:
+    {
+        "archetype": "corporate",
+        "power_level": "lieutenant",
+        "specialization": "security",  # Optional
+        "name": "Auto"  # or specific name
+    }
+    """
+    # Implementation
+    data = request.json
+    
+    # Select appropriate template
+    template = NPCTemplate.query.filter_by(
+        archetype=data['archetype']
+    ).first()
+    
+    # Generate NPC based on template and power level
+    npc_data = {
+        "name": generate_name(data['name'], data['archetype']) if data['name'] == "Auto" else data['name'],
+        "attributes": generate_attributes(template, data['power_level']),
+        "skills": generate_skills(template, data['power_level'], data.get('specialization')),
+        "equipment": generate_equipment(template, data['power_level']),
+        "personality": generate_personality(template),
+        "hooks": generate_hooks(template, data['archetype'])
+    }
+    
+    # Save to database
+    npc = Entity(
+        session_id=session_id,
+        name=npc_data['name'],
+        type='npc',
+        status='active',
+        extra_data=json.dumps(npc_data)
+    )
+    db.session.add(npc)
+    db.session.commit()
+    
+    return jsonify({"npc_id": npc.id, "npc_data": npc_data})
+```
+
+## Sample Templates
+
+### Corporate Security Template
+
+```json
+{
+  "name": "Corporate Security",
+  "archetype": "corporate",
+  "attribute_priorities": ["Agility", "Reaction", "Body", "Strength", "Willpower", "Logic", "Intuition", "Charisma"],
+  "skill_groups": {
+    "combat": {
+      "weight": 0.6,
+      "skills": ["Firearms", "Close Combat", "Athletics"]
+    },
+    "physical": {
+      "weight": 0.3,
+      "skills": ["Perception", "Stealth", "Infiltration"]
+    },
+    "social": {
+      "weight": 0.1,
+      "skills": ["Intimidation", "Etiquette"]
+    }
+  },
+  "equipment_categories": {
+    "weapons": {
+      "weight": 0.4,
+      "items": ["Ares Predator", "Fichetti Security 600", "Stun Baton", "Telescoping Staff"]
+    },
+    "armor": {
+      "weight": 0.3,
+      "items": ["Armor Jacket", "Armor Vest", "Security Uniform"]
+    },
+    "electronics": {
+      "weight": 0.2,
+      "items": ["Commlink (Rating 3)", "Smartglasses", "Earbuds with Select Sound Filter"]
+    },
+    "other": {
+      "weight": 0.1,
+      "items": ["Restraints", "Flashlight", "Credstick (Standard)"]
+    }
+  },
+  "personality_traits": {
+    "dutiful": 0.3,
+    "suspicious": 0.2,
+    "professional": 0.2,
+    "aggressive": 0.15,
+    "bored": 0.1,
+    "corrupt": 0.05
+  },
+  "motivations": {
+    "career advancement": 0.3,
+    "steady paycheck": 0.3,
+    "company loyalty": 0.2,
+    "thrill of power": 0.1,
+    "protecting innocents": 0.05,
+    "information selling": 0.05
+  }
+}
+```
+
+## Narrative Hook Generation
+
+Hooks are generated by combining personality traits, motivations, and random elements appropriate to the NPC's archetype:
+
+```python
+def generate_hooks(template, archetype):
+    hooks = []
+    
+    # Select personality trait and motivation
+    trait = weighted_select(json.loads(template.personality_traits))
+    motivation = weighted_select(json.loads(template.motivations))
+    
+    # Generate archetype-specific hook
+    if archetype == "corporate":
+        if trait == "corrupt" or motivation == "information selling":
+            hooks.append("Willing to sell corporate secrets for the right price")
+        elif trait == "dutiful" and motivation == "company loyalty":
+            hooks.append("Reports unusual activity directly to higher management")
+    
+    # Add more generic hooks
+    hooks.append(f"Motivated primarily by {motivation}")
+    hooks.append(f"Approaches situations in a {trait} manner")
+    
+    return hooks
+```

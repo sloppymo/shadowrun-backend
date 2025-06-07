@@ -144,3 +144,106 @@ async def call_llm(model, messages, stream=False, model_name=None):
         return await call_openrouter(messages, model_name or "openai/gpt-4o", stream)
     else:
         raise ValueError(f"Unknown model: {model}")
+
+# --- DM Review System Functions ---
+
+async def create_pending_response(session_id, user_id, context, response_type='narrative', priority=1):
+    """
+    Create a pending AI response that requires DM review.
+    Returns the pending response ID for tracking.
+    """
+    from app import db, PendingResponse, DmNotification, Session
+    import uuid
+    
+    # Generate AI response
+    messages = [
+        {"role": "system", "content": "You are an expert Shadowrun GM AI. Provide a creative, rules-accurate response to the player's action. Keep responses concise but engaging."},
+        {"role": "user", "content": context}
+    ]
+    
+    try:
+        # Generate the AI response (non-streaming for review workflow)
+        llm_response = await call_openai(messages, stream=False)
+        ai_response = llm_response['choices'][0]['message']['content']
+        
+        # Create pending response
+        pending_id = str(uuid.uuid4())
+        pending = PendingResponse(
+            id=pending_id,
+            session_id=session_id,
+            user_id=user_id,
+            context=context,
+            ai_response=ai_response,
+            response_type=response_type,
+            priority=priority
+        )
+        
+        # Get the GM for this session
+        session = Session.query.filter_by(id=session_id).first()
+        if session:
+            # Create notification for the DM
+            notification = DmNotification(
+                session_id=session_id,
+                dm_user_id=session.gm_user_id,
+                pending_response_id=pending_id,
+                notification_type='new_review' if priority <= 2 else 'urgent_review',
+                message=f"New {response_type} response needs review from player {user_id}"
+            )
+            
+            db.session.add(notification)
+        
+        db.session.add(pending)
+        db.session.commit()
+        
+        return {
+            'status': 'pending_review',
+            'pending_response_id': pending_id,
+            'message': 'Response generated and queued for DM review'
+        }
+        
+    except Exception as e:
+        print(f"Error creating pending response: {str(e)}")
+        raise e
+
+async def get_reviewed_response(pending_response_id):
+    """
+    Get a reviewed response by ID. Returns None if still pending.
+    """
+    from app import PendingResponse
+    
+    pending = PendingResponse.query.filter_by(id=pending_response_id).first()
+    if not pending:
+        return None
+    
+    if pending.status in ['approved', 'edited']:
+        return {
+            'status': pending.status,
+            'response': pending.final_response,
+            'dm_notes': pending.dm_notes,
+            'reviewed_at': pending.reviewed_at.isoformat() if pending.reviewed_at else None
+        }
+    elif pending.status == 'rejected':
+        return {
+            'status': 'rejected',
+            'dm_notes': pending.dm_notes,
+            'reviewed_at': pending.reviewed_at.isoformat() if pending.reviewed_at else None
+        }
+    else:
+        return {
+            'status': 'pending',
+            'message': 'Still awaiting DM review'
+        }
+
+async def call_llm_with_review(session_id, user_id, context, model='openai', response_type='narrative', priority=1, require_review=True):
+    """
+    Enhanced LLM call that can either require DM review or provide immediate response.
+    """
+    if require_review:
+        return await create_pending_response(session_id, user_id, context, response_type, priority)
+    else:
+        # Direct LLM call without review
+        messages = [
+            {"role": "system", "content": "You are an expert Shadowrun GM AI. Provide a creative, rules-accurate response to the player's action."},
+            {"role": "user", "content": context}
+        ]
+        return await call_llm(model, messages, stream=False)

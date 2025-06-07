@@ -1,9 +1,17 @@
 import os
-from flask import Flask, request, jsonify
+import uuid
+import asyncio
+import json
+import traceback
+from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy.exc import IntegrityError
 from dotenv import load_dotenv
-import uuid
+import httpx
+
+# Import local modules
+from llm_utils import call_llm, call_llm_with_review, get_reviewed_response, call_openai_stream
 
 # Load environment variables
 env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -76,12 +84,47 @@ class Character(db.Model):
     core_strengths = db.Column(db.Text, nullable=True)  # JSON: [{label, description, mechanical_effect}]
     created_at = db.Column(db.DateTime, server_default=db.func.now())
 
+# --- DM Review System Models ---
+class PendingResponse(db.Model):
+    """Stores AI-generated responses awaiting DM review"""
+    id = db.Column(db.String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    session_id = db.Column(db.String, db.ForeignKey('session.id'), nullable=False)
+    user_id = db.Column(db.String, nullable=False)  # Player who triggered the AI response
+    context = db.Column(db.Text, nullable=False)  # Original player input/context
+    ai_response = db.Column(db.Text, nullable=False)  # Generated AI response
+    response_type = db.Column(db.String, nullable=False)  # 'narrative', 'dice_roll', 'npc_action', etc.
+    status = db.Column(db.String, nullable=False, default='pending')  # 'pending', 'approved', 'rejected', 'edited'
+    dm_notes = db.Column(db.Text, nullable=True)  # DM's notes/comments
+    final_response = db.Column(db.Text, nullable=True)  # Final approved/edited response
+    created_at = db.Column(db.DateTime, server_default=db.func.now())
+    reviewed_at = db.Column(db.DateTime, nullable=True)
+    priority = db.Column(db.Integer, nullable=False, default=1)  # 1=low, 2=medium, 3=high
+
+class DmNotification(db.Model):
+    """Notifications for DMs about pending reviews"""
+    id = db.Column(db.Integer, primary_key=True)
+    session_id = db.Column(db.String, db.ForeignKey('session.id'), nullable=False)
+    dm_user_id = db.Column(db.String, nullable=False)
+    pending_response_id = db.Column(db.String, db.ForeignKey('pending_response.id'), nullable=False)
+    notification_type = db.Column(db.String, nullable=False)  # 'new_review', 'urgent_review'
+    message = db.Column(db.String, nullable=False)
+    is_read = db.Column(db.Boolean, nullable=False, default=False)
+    created_at = db.Column(db.DateTime, server_default=db.func.now())
+
+class ReviewHistory(db.Model):
+    """Audit trail of DM review actions"""
+    id = db.Column(db.Integer, primary_key=True)
+    pending_response_id = db.Column(db.String, db.ForeignKey('pending_response.id'), nullable=False)
+    dm_user_id = db.Column(db.String, nullable=False)
+    action = db.Column(db.String, nullable=False)  # 'approved', 'rejected', 'edited'
+    original_response = db.Column(db.Text, nullable=True)  # For tracking edits
+    final_response = db.Column(db.Text, nullable=True)
+    notes = db.Column(db.Text, nullable=True)
+    created_at = db.Column(db.DateTime, server_default=db.func.now())
 
 # --- API Endpoints ---
 
 # --- Character Endpoints ---
-from sqlalchemy.exc import IntegrityError
-
 @app.route('/api/session/<session_id>/characters', methods=['GET'])
 def get_characters(session_id):
     chars = Character.query.filter_by(session_id=session_id).all()
@@ -279,6 +322,210 @@ def delete_entity(session_id, entity_id):
     db.session.commit()
     return jsonify({'status': 'deleted'})
 
+# --- DM Review System API Endpoints ---
+
+@app.route('/api/session/<session_id>/pending-responses', methods=['GET'])
+def get_pending_responses(session_id):
+    """Get all pending responses for a session (DMs only)"""
+    user_id = request.args.get('user_id')
+    if not user_id:
+        return jsonify({'error': 'user_id is required'}), 400
+    
+    # Verify the user is the GM for this session
+    session = Session.query.filter_by(id=session_id).first()
+    if not session or session.gm_user_id != user_id:
+        return jsonify({'error': 'Only GMs can view pending responses'}), 403
+    
+    pending = PendingResponse.query.filter_by(session_id=session_id, status='pending').order_by(
+        PendingResponse.priority.desc(), PendingResponse.created_at.asc()
+    ).all()
+    
+    return jsonify([{
+        'id': p.id,
+        'user_id': p.user_id,
+        'context': p.context,
+        'ai_response': p.ai_response,
+        'response_type': p.response_type,
+        'priority': p.priority,
+        'created_at': p.created_at.isoformat() if p.created_at else None
+    } for p in pending])
+
+@app.route('/api/session/<session_id>/pending-response/<response_id>/review', methods=['POST'])
+def review_response(session_id, response_id):
+    """DM reviews and approves/rejects/edits a pending response"""
+    data = request.json
+    dm_user_id = data.get('user_id')
+    action = data.get('action')  # 'approve', 'reject', 'edit'
+    final_response = data.get('final_response', '')
+    dm_notes = data.get('dm_notes', '')
+    
+    if not dm_user_id or not action:
+        return jsonify({'error': 'user_id and action are required'}), 400
+    
+    # Verify the user is the GM for this session
+    session = Session.query.filter_by(id=session_id).first()
+    if not session or session.gm_user_id != dm_user_id:
+        return jsonify({'error': 'Only GMs can review responses'}), 403
+    
+    pending = PendingResponse.query.filter_by(id=response_id, session_id=session_id).first()
+    if not pending:
+        return jsonify({'error': 'Pending response not found'}), 404
+    
+    # Create review history entry
+    original_response = pending.ai_response
+    
+    # Update pending response based on action
+    if action == 'approve':
+        pending.status = 'approved'
+        pending.final_response = pending.ai_response
+    elif action == 'reject':
+        pending.status = 'rejected'
+        pending.final_response = None
+    elif action == 'edit':
+        pending.status = 'edited'
+        pending.final_response = final_response
+    else:
+        return jsonify({'error': 'Invalid action'}), 400
+    
+    pending.dm_notes = dm_notes
+    pending.reviewed_at = db.func.now()
+    
+    # Create review history
+    history = ReviewHistory(
+        pending_response_id=response_id,
+        dm_user_id=dm_user_id,
+        action=action,
+        original_response=original_response,
+        final_response=pending.final_response,
+        notes=dm_notes
+    )
+    
+    db.session.add(history)
+    db.session.commit()
+    
+    return jsonify({'status': 'success', 'action': action})
+
+@app.route('/api/session/<session_id>/dm/notifications', methods=['GET'])
+def get_dm_notifications(session_id):
+    """Get unread notifications for the DM"""
+    dm_user_id = request.args.get('user_id')
+    if not dm_user_id:
+        return jsonify({'error': 'user_id is required'}), 400
+    
+    # Verify the user is the GM for this session
+    session = Session.query.filter_by(id=session_id).first()
+    if not session or session.gm_user_id != dm_user_id:
+        return jsonify({'error': 'Only GMs can view notifications'}), 403
+    
+    notifications = DmNotification.query.filter_by(
+        session_id=session_id, 
+        dm_user_id=dm_user_id,
+        is_read=False
+    ).order_by(DmNotification.created_at.desc()).all()
+    
+    return jsonify([{
+        'id': n.id,
+        'pending_response_id': n.pending_response_id,
+        'notification_type': n.notification_type,
+        'message': n.message,
+        'created_at': n.created_at.isoformat() if n.created_at else None
+    } for n in notifications])
+
+@app.route('/api/session/<session_id>/dm/notifications/<int:notification_id>/mark-read', methods=['POST'])
+def mark_notification_read(session_id, notification_id):
+    """Mark a notification as read"""
+    data = request.json
+    dm_user_id = data.get('user_id')
+    
+    if not dm_user_id:
+        return jsonify({'error': 'user_id is required'}), 400
+    
+    notification = DmNotification.query.filter_by(
+        id=notification_id,
+        session_id=session_id,
+        dm_user_id=dm_user_id
+    ).first()
+    
+    if not notification:
+        return jsonify({'error': 'Notification not found'}), 404
+    
+    notification.is_read = True
+    db.session.commit()
+    
+    return jsonify({'status': 'success'})
+
+@app.route('/api/session/<session_id>/player/<user_id>/approved-responses', methods=['GET'])
+def get_approved_responses(session_id, user_id):
+    """Get approved responses for a specific player"""
+    responses = PendingResponse.query.filter_by(
+        session_id=session_id,
+        user_id=user_id,
+        status='approved'
+    ).order_by(PendingResponse.reviewed_at.desc()).all()
+    
+    return jsonify([{
+        'id': r.id,
+        'context': r.context,
+        'final_response': r.final_response,
+        'response_type': r.response_type,
+        'dm_notes': r.dm_notes,
+        'reviewed_at': r.reviewed_at.isoformat() if r.reviewed_at else None
+    } for r in responses])
+
+@app.route('/api/session/<session_id>/llm-with-review', methods=['POST'])
+def llm_with_review(session_id):
+    """
+    Enhanced LLM endpoint that supports DM review workflow
+    """
+    data = request.json
+    user_id = data.get('user_id')
+    context = data.get('context', data.get('input', ''))
+    response_type = data.get('response_type', 'narrative')
+    priority = data.get('priority', 1)
+    require_review = data.get('require_review', True)
+    model = data.get('model', 'openai')
+    
+    if not user_id or not context:
+        return jsonify({'error': 'user_id and context are required'}), 400
+    
+    # Validate session and user
+    session = Session.query.filter_by(id=session_id).first()
+    if not session:
+        return jsonify({'error': 'Invalid session_id'}), 400
+    
+    user_role = UserRole.query.filter_by(session_id=session_id, user_id=user_id).first()
+    if not user_role:
+        return jsonify({'error': 'User not in session'}), 403
+    
+    try:
+        result = asyncio.run(call_llm_with_review(
+            session_id=session_id,
+            user_id=user_id,
+            context=context,
+            model=model,
+            response_type=response_type,
+            priority=priority,
+            require_review=require_review
+        ))
+        return jsonify(result)
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/pending-response/<response_id>/status', methods=['GET'])
+def check_pending_response_status(response_id):
+    """
+    Check the status of a pending response
+    """
+    try:
+        result = asyncio.run(get_reviewed_response(response_id))
+        if result is None:
+            return jsonify({'error': 'Pending response not found'}), 404
+        return jsonify(result)
+    
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/api/ping')
 def ping():
     return jsonify({'status': 'ok', 'message': 'Shadowrun backend is alive.'})
@@ -315,11 +562,7 @@ def get_session_users(session_id):
         for u in users
     ])
 
-import asyncio
-from llm_utils import call_llm
-from flask import Response
-import httpx
-import traceback
+# Imports moved to top of file
 
 # --- Command Routing with Model Selection ---
 @app.route('/api/command', methods=['POST'])
@@ -402,8 +645,7 @@ def llm_stream():
     headers = {'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache'}
     return Response(generate(), headers=headers)
 
-from flask import stream_with_context
-import json
+# Imports moved to top of file
 
 @app.route("/api/chat", methods=["POST"])
 def chat():
@@ -430,8 +672,7 @@ def chat():
     # Append the new user message
     messages.append({"role": "user", "content": user_input})
 
-    from llm_utils import call_openai_stream
-    import asyncio
+    # Imports available at top of file
 
     def event_stream():
         loop = asyncio.new_event_loop()
