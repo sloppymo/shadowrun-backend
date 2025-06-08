@@ -1,0 +1,64 @@
+# Development dependencies for Shadowrun RPG Backend
+
+# Testing
+pytest==7.4.3
+pytest-asyncio==0.21.1
+pytest-cov==4.1.0
+pytest-mock==3.12.0
+
+# Code Quality
+black==23.11.0
+flake8==6.1.0
+mypy==1.7.1
+pre-commit==3.5.0
+
+# Security Testing
+bandit==1.7.5
+safety==2.3.5
+
+# Performance Testing
+locust==2.17.0
+
+# Documentation
+sphinx==7.2.6
+sphinx-rtd-theme==2.0.0
+
+# Debugging
+ipdb==0.13.13
+flask-debugtoolbar==0.13.1
+
+# Development Tools
+python-dotenv==1.0.0
+watchdog==3.0.0
+
+# Type Stubs
+types-requests==2.31.0
+types-flask==1.1.6
+
+# Database
+flask-migrate==4.0.5
+
+# API Testing
+httpie==3.2.2
+postman-collection-runner==0.1.0
+
+# Monitoring
+flask-profiler==1.8.1
+memory-profiler==0.61.0
+
+# Additional Testing Tools
+factory-boy==3.3.0
+faker==20.1.0
+responses==0.24.1
+
+# Code Coverage
+coverage==7.3.2
+coveralls==3.3.1
+
+# Static Analysis
+pylint==3.0.2
+pycodestyle==2.11.1
+
+# Dependency Management
+pip-tools==7.3.0
+pipdeptree==2.13.1 
