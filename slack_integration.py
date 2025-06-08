@@ -38,18 +38,30 @@ class SlackBot:
         return self.bot_token is not None and self.signing_secret is not None
     
     def verify_slack_request(self, headers: Dict, body: str) -> bool:
-        """Verify that the request came from Slack"""
+        """Verify that the request came from Slack with enhanced security"""
         if not self.signature_verifier:
             return False
         
         try:
+            from utils.validators import SlackRequestSchema
+            from pydantic import ValidationError
+            
             timestamp = headers.get("X-Slack-Request-Timestamp", "")
             signature = headers.get("X-Slack-Signature", "")
             
-            # Check timestamp to prevent replay attacks
-            if abs(time.time() - int(timestamp)) > 60 * 5:  # 5 minutes
+            # Validate request with enhanced security checks
+            try:
+                # Validate timestamp format and freshness
+                SlackRequestSchema(
+                    timestamp=timestamp,
+                    signature=signature,
+                    body=json.loads(body) if isinstance(body, str) else body
+                )
+            except ValidationError as e:
+                print(f"Slack request validation failed: {e}")
                 return False
             
+            # Verify signature
             return self.signature_verifier.is_valid(
                 timestamp=timestamp,
                 signature=signature,

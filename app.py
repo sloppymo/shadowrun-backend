@@ -526,6 +526,9 @@ def llm_with_review(session_id):
     """
     Enhanced LLM endpoint that supports DM review workflow
     """
+    from utils.validators import AIInputSchema
+    from pydantic import ValidationError
+    
     data = request.json
     user_id = data.get('user_id')
     context = data.get('context', data.get('input', ''))
@@ -536,6 +539,18 @@ def llm_with_review(session_id):
     
     if not user_id or not context:
         return jsonify({'error': 'user_id and context are required'}), 400
+    
+    # Validate AI input
+    try:
+        validated_input = AIInputSchema(
+            prompt=context,
+            user_id=user_id,
+            session_id=session_id,
+            context=data
+        )
+        context = validated_input.prompt  # Use sanitized prompt
+    except ValidationError as e:
+        return jsonify({'error': f'Invalid input: {str(e)}'}), 400
     
     # Validate session and user
     session = Session.query.filter_by(id=session_id).first()
@@ -868,6 +883,9 @@ def route_command():
 # --- LLM Streaming Endpoint ---
 @app.route('/api/llm', methods=['POST'])
 def llm_stream():
+    from utils.validators import AIInputSchema
+    from pydantic import ValidationError
+    
     data = request.json
     session_id = data.get('session_id')
     user_id = data.get('user_id')
@@ -875,6 +893,18 @@ def llm_stream():
     model = data.get('model', 'openai')
     model_name = data.get('model_name')
     stream = True
+
+    # Validate AI input
+    try:
+        validated_input = AIInputSchema(
+            prompt=user_input or '',
+            user_id=user_id or 'anonymous',
+            session_id=session_id or 'default',
+            context=data
+        )
+        user_input = validated_input.prompt  # Use sanitized prompt
+    except ValidationError as e:
+        return jsonify({'status': 'error', 'error': f'Invalid input: {str(e)}'}), 400
 
     # Validate session and user
     session = Session.query.filter_by(id=session_id).first()
