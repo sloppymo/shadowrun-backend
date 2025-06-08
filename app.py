@@ -9,9 +9,11 @@ from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy.exc import IntegrityError
 from dotenv import load_dotenv
 import httpx
+from datetime import datetime
 
 # Import local modules
 from llm_utils import call_llm, call_llm_with_review, get_reviewed_response, call_openai_stream
+from image_gen_utils import create_image_generation_request, process_image_generation, get_session_images
 
 # Load environment variables
 env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -121,6 +123,40 @@ class ReviewHistory(db.Model):
     final_response = db.Column(db.Text, nullable=True)
     notes = db.Column(db.Text, nullable=True)
     created_at = db.Column(db.DateTime, server_default=db.func.now())
+
+class GeneratedImage(db.Model):
+    """Stores generated scene images"""
+    id = db.Column(db.String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    session_id = db.Column(db.String, db.ForeignKey('session.id'), nullable=False)
+    user_id = db.Column(db.String, nullable=False)  # User who requested the image
+    prompt = db.Column(db.Text, nullable=False)  # Original description/prompt
+    enhanced_prompt = db.Column(db.Text, nullable=True)  # AI-enhanced prompt for image generation
+    image_url = db.Column(db.String, nullable=True)  # URL to generated image
+    thumbnail_url = db.Column(db.String, nullable=True)  # URL to thumbnail
+    provider = db.Column(db.String, nullable=False)  # 'dalle', 'stable_diffusion', 'midjourney'
+    status = db.Column(db.String, nullable=False, default='pending')  # 'pending', 'generating', 'completed', 'failed'
+    error_message = db.Column(db.Text, nullable=True)  # Error details if generation failed
+    generation_time = db.Column(db.Float, nullable=True)  # Time taken to generate (seconds)
+    tags = db.Column(db.Text, nullable=True)  # JSON: scene tags for categorization
+    is_favorite = db.Column(db.Boolean, nullable=False, default=False)
+    created_at = db.Column(db.DateTime, server_default=db.func.now())
+    completed_at = db.Column(db.DateTime, nullable=True)
+
+class ImageGeneration(db.Model):
+    """Tracks image generation requests and queue"""
+    id = db.Column(db.String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    session_id = db.Column(db.String, db.ForeignKey('session.id'), nullable=False)
+    user_id = db.Column(db.String, nullable=False)
+    request_type = db.Column(db.String, nullable=False)  # 'scene', 'character', 'location', 'item'
+    context = db.Column(db.Text, nullable=False)  # Scene description or context
+    style_preferences = db.Column(db.Text, nullable=True)  # JSON: style settings
+    priority = db.Column(db.Integer, nullable=False, default=1)  # 1=low, 2=medium, 3=high
+    status = db.Column(db.String, nullable=False, default='queued')  # 'queued', 'processing', 'completed', 'failed'
+    result_image_id = db.Column(db.String, db.ForeignKey('generated_image.id'), nullable=True)
+    retry_count = db.Column(db.Integer, nullable=False, default=0)
+    created_at = db.Column(db.DateTime, server_default=db.func.now())
+    started_at = db.Column(db.DateTime, nullable=True)
+    completed_at = db.Column(db.DateTime, nullable=True)
 
 # --- API Endpoints ---
 
@@ -561,6 +597,232 @@ def get_session_users(session_id):
         {'user_id': u.user_id, 'role': u.role}
         for u in users
     ])
+
+# --- Image Generation Endpoints ---
+@app.route('/api/session/<session_id>/generate-image', methods=['POST'])
+def generate_image_endpoint(session_id):
+    """Request image generation for a scene or description"""
+    try:
+        data = request.json
+        user_id = data.get('user_id')
+        prompt = data.get('prompt')
+        request_type = data.get('type', 'scene')  # 'scene', 'character', 'location', 'item'
+        priority = data.get('priority', 1)
+        style_preferences = data.get('style_preferences', {})
+        
+        if not user_id or not prompt:
+            return jsonify({'error': 'Missing required fields: user_id, prompt'}), 400
+        
+        # Validate session and user
+        session = Session.query.filter_by(id=session_id).first()
+        if not session:
+            return jsonify({'error': 'Invalid session_id'}), 400
+        
+        user_role = UserRole.query.filter_by(session_id=session_id, user_id=user_id).first()
+        if not user_role:
+            return jsonify({'error': 'User not in session'}), 403
+        
+        # Create image generation request
+        img_request = ImageGeneration(
+            session_id=session_id,
+            user_id=user_id,
+            request_type=request_type,
+            context=prompt,
+            style_preferences=json.dumps(style_preferences),
+            priority=priority
+        )
+        
+        db.session.add(img_request)
+        db.session.commit()
+        request_id = img_request.id
+        
+        return jsonify({
+            'status': 'success',
+            'request_id': request_id,
+            'message': 'Image generation request queued'
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/session/<session_id>/generate-image-instant', methods=['POST'])
+def generate_image_instant(session_id):
+    """Generate image immediately (synchronous)"""
+    try:
+        data = request.json
+        user_id = data.get('user_id')
+        prompt = data.get('prompt')
+        provider = data.get('provider', 'dalle')
+        style_preferences = data.get('style_preferences', {})
+        
+        if not user_id or not prompt:
+            return jsonify({'error': 'Missing required fields: user_id, prompt'}), 400
+        
+        # Validate session and user
+        session = Session.query.filter_by(id=session_id).first()
+        if not session:
+            return jsonify({'error': 'Invalid session_id'}), 400
+        
+        user_role = UserRole.query.filter_by(session_id=session_id, user_id=user_id).first()
+        if not user_role:
+            return jsonify({'error': 'User not in session'}), 403
+        
+        # Generate image directly
+        from image_gen_utils import ImageGenerator
+        generator = ImageGenerator()
+        
+        result = asyncio.run(generator.generate_image(
+            prompt=prompt,
+            provider=provider,
+            context=f"Session: {session_id}",
+            **style_preferences
+        ))
+        
+        # Save result to database
+        generated_image = GeneratedImage(
+            session_id=session_id,
+            user_id=user_id,
+            prompt=prompt,
+            enhanced_prompt=result.get("revised_prompt", prompt),
+            image_url=result["image_url"],
+            provider=result["provider"],
+            status="completed",
+            generation_time=result["generation_time"],
+            completed_at=datetime.utcnow()
+        )
+        
+        db.session.add(generated_image)
+        db.session.commit()
+        
+        return jsonify({
+            'status': 'success',
+            'image_id': generated_image.id,
+            'image_url': result["image_url"],
+            'generation_time': result["generation_time"],
+            'provider': result["provider"]
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/session/<session_id>/images', methods=['GET'])
+def get_session_images_endpoint(session_id):
+    """Get generated images for a session"""
+    try:
+        user_id = request.args.get('user_id')
+        limit = int(request.args.get('limit', 20))
+        
+        # Validate session
+        session = Session.query.filter_by(id=session_id).first()
+        if not session:
+            return jsonify({'error': 'Invalid session_id'}), 400
+        
+        # Get images directly from database
+        query = GeneratedImage.query.filter_by(session_id=session_id)
+        if user_id:
+            query = query.filter_by(user_id=user_id)
+        
+        images_db = query.order_by(GeneratedImage.created_at.desc()).limit(limit).all()
+        
+        images = [
+            {
+                "id": img.id,
+                "prompt": img.prompt,
+                "image_url": img.image_url,
+                "provider": img.provider,
+                "status": img.status,
+                "created_at": img.created_at.isoformat(),
+                "is_favorite": img.is_favorite,
+                "tags": json.loads(img.tags) if img.tags else []
+            }
+            for img in images_db
+        ]
+        
+        return jsonify({
+            'status': 'success',
+            'images': images,
+            'count': len(images)
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/session/<session_id>/image/<image_id>', methods=['GET'])
+def get_image_details(session_id, image_id):
+    """Get details of a specific generated image"""
+    try:
+        image = GeneratedImage.query.filter_by(id=image_id, session_id=session_id).first()
+        if not image:
+            return jsonify({'error': 'Image not found'}), 404
+        
+        return jsonify({
+            'status': 'success',
+            'image': {
+                'id': image.id,
+                'prompt': image.prompt,
+                'enhanced_prompt': image.enhanced_prompt,
+                'image_url': image.image_url,
+                'provider': image.provider,
+                'status': image.status,
+                'generation_time': image.generation_time,
+                'created_at': image.created_at.isoformat(),
+                'is_favorite': image.is_favorite,
+                'tags': json.loads(image.tags) if image.tags else []
+            }
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/session/<session_id>/image/<image_id>/favorite', methods=['POST'])
+def toggle_image_favorite(session_id, image_id):
+    """Toggle favorite status of an image"""
+    try:
+        data = request.json
+        user_id = data.get('user_id')
+        is_favorite = data.get('is_favorite', True)
+        
+        if not user_id:
+            return jsonify({'error': 'Missing user_id'}), 400
+        
+        image = GeneratedImage.query.filter_by(id=image_id, session_id=session_id).first()
+        if not image:
+            return jsonify({'error': 'Image not found'}), 404
+        
+        # Check if user has permission to modify this image
+        if image.user_id != user_id:
+            user_role = UserRole.query.filter_by(session_id=session_id, user_id=user_id).first()
+            if not user_role or user_role.role != 'gm':
+                return jsonify({'error': 'Permission denied'}), 403
+        
+        image.is_favorite = is_favorite
+        db.session.commit()
+        
+        return jsonify({
+            'status': 'success',
+            'image_id': image_id,
+            'is_favorite': is_favorite
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/session/<session_id>/image-providers', methods=['GET'])
+def get_available_providers(session_id):
+    """Get list of available image generation providers"""
+    try:
+        from image_gen_utils import ImageGenerator
+        generator = ImageGenerator()
+        providers = generator.get_available_providers()
+        
+        return jsonify({
+            'status': 'success',
+            'providers': providers,
+            'default': 'dalle' if 'dalle' in providers else providers[0] if providers else None
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 # Imports moved to top of file
 
