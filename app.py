@@ -10,10 +10,12 @@ from sqlalchemy.exc import IntegrityError
 from dotenv import load_dotenv
 import httpx
 from datetime import datetime
+from typing import Dict, Optional
 
 # Import local modules
 from llm_utils import call_llm, call_llm_with_review, get_reviewed_response, call_openai_stream
 from image_gen_utils import create_image_generation_request, process_image_generation, get_session_images
+from slack_integration import slack_bot, slack_processor
 
 # Load environment variables
 env_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -157,6 +159,17 @@ class ImageGeneration(db.Model):
     created_at = db.Column(db.DateTime, server_default=db.func.now())
     started_at = db.Column(db.DateTime, nullable=True)
     completed_at = db.Column(db.DateTime, nullable=True)
+
+class SlackSession(db.Model):
+    """Maps Slack channels to game sessions"""
+    id = db.Column(db.Integer, primary_key=True)
+    slack_team_id = db.Column(db.String, nullable=False)
+    slack_channel_id = db.Column(db.String, nullable=False)
+    session_id = db.Column(db.String, db.ForeignKey('session.id'), nullable=False)
+    created_at = db.Column(db.DateTime, server_default=db.func.now())
+    
+    # Ensure unique mapping per channel
+    __table_args__ = (db.UniqueConstraint('slack_team_id', 'slack_channel_id'),)
 
 # --- API Endpoints ---
 
@@ -963,6 +976,332 @@ def index():
 
 from stream_proxy import stream_proxy
 app.register_blueprint(stream_proxy)
+
+# --- Slack Integration Endpoints ---
+@app.route('/api/slack/command', methods=['POST'])
+def handle_slack_command():
+    """Handle Slack slash commands"""
+    try:
+        # Verify the request came from Slack
+        if not slack_bot.verify_slack_request(request.headers, request.get_data(as_text=True)):
+            return jsonify({'error': 'Invalid request signature'}), 401
+        
+        # Parse form data from Slack
+        command_data = {
+            'command': request.form.get('command'),
+            'text': request.form.get('text', ''),
+            'user_id': request.form.get('user_id'),
+            'channel_id': request.form.get('channel_id'),
+            'team_id': request.form.get('team_id'),
+            'user_name': request.form.get('user_name'),
+            'channel_name': request.form.get('channel_name'),
+            'team_domain': request.form.get('team_domain'),
+            'response_url': request.form.get('response_url')
+        }
+        
+        # Process the command
+        response = asyncio.run(slack_processor.process_command(command_data))
+        
+        return jsonify(response)
+        
+    except Exception as e:
+        print(f"Slack command error: {e}")
+        return jsonify({
+            'response_type': 'ephemeral',
+            'text': f'Error processing command: {str(e)}'
+        }), 500
+
+@app.route('/api/slack/events', methods=['POST'])
+def handle_slack_events():
+    """Handle Slack events (URL verification, app mentions, etc.)"""
+    try:
+        # Verify the request came from Slack
+        if not slack_bot.verify_slack_request(request.headers, request.get_data(as_text=True)):
+            return jsonify({'error': 'Invalid request signature'}), 401
+        
+        event_data = request.json
+        
+        # Handle URL verification challenge
+        if event_data.get('type') == 'url_verification':
+            return jsonify({'challenge': event_data.get('challenge')})
+        
+        # Handle other events
+        if event_data.get('type') == 'event_callback':
+            event = event_data.get('event', {})
+            
+            # Handle app mentions
+            if event.get('type') == 'app_mention':
+                asyncio.run(handle_app_mention(event))
+        
+        return jsonify({'status': 'ok'})
+        
+    except Exception as e:
+        print(f"Slack events error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/slack/interactive', methods=['POST'])
+def handle_slack_interactive():
+    """Handle Slack interactive components (buttons, modals, etc.)"""
+    try:
+        # Verify the request came from Slack
+        if not slack_bot.verify_slack_request(request.headers, request.get_data(as_text=True)):
+            return jsonify({'error': 'Invalid request signature'}), 401
+        
+        payload = json.loads(request.form.get('payload', '{}'))
+        
+        # Handle button clicks
+        if payload.get('type') == 'block_actions':
+            actions = payload.get('actions', [])
+            for action in actions:
+                if action.get('action_id') == 'dm_dashboard_button':
+                    # Open DM dashboard
+                    channel_id = payload['channel']['id']
+                    team_id = payload['team']['id']
+                    
+                    dashboard_url = f"http://localhost:3000/console?dm=true&session={team_id}_{channel_id}"
+                    
+                    return jsonify({
+                        'response_type': 'ephemeral',
+                        'text': f'Opening DM Dashboard: {dashboard_url}'
+                    })
+        
+        return jsonify({'status': 'ok'})
+        
+    except Exception as e:
+        print(f"Slack interactive error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+# --- Slack Helper Functions ---
+async def create_session_for_slack(name: str, gm_user_id: str, slack_channel_id: str, slack_team_id: str) -> Dict:
+    """Create a game session for Slack channel"""
+    # Create regular session
+    session = Session(name=name, gm_user_id=gm_user_id)
+    db.session.add(session)
+    db.session.flush()  # Get the ID
+    
+    # Create Slack mapping
+    slack_session = SlackSession(
+        slack_team_id=slack_team_id,
+        slack_channel_id=slack_channel_id,
+        session_id=session.id
+    )
+    db.session.add(slack_session)
+    
+    # Add GM to session
+    gm_role = UserRole(session_id=session.id, user_id=gm_user_id, role='gm')
+    db.session.add(gm_role)
+    
+    db.session.commit()
+    
+    return {
+        'session_id': session.id,
+        'name': session.name,
+        'gm_user_id': session.gm_user_id
+    }
+
+async def get_slack_session_info(slack_session_id: str) -> Optional[Dict]:
+    """Get session info for a Slack channel"""
+    team_id, channel_id = slack_session_id.split('_', 1)
+    
+    slack_session = SlackSession.query.filter_by(
+        slack_team_id=team_id,
+        slack_channel_id=channel_id
+    ).first()
+    
+    if not slack_session:
+        return None
+    
+    session = Session.query.get(slack_session.session_id)
+    if not session:
+        return None
+    
+    # Get players
+    players = UserRole.query.filter_by(session_id=session.id).all()
+    
+    return {
+        'session_id': session.id,
+        'name': session.name,
+        'gm_user_id': session.gm_user_id,
+        'players': [{'user_id': p.user_id, 'role': p.role} for p in players],
+        'created_at': session.created_at.isoformat()
+    }
+
+async def process_slack_ai_request(session_id: str, user_id: str, message: str, channel_id: str):
+    """Process AI request from Slack and notify when reviewed"""
+    try:
+        # Get actual session ID from Slack session
+        team_id, slack_channel_id = session_id.split('_', 1)
+        slack_session = SlackSession.query.filter_by(
+            slack_team_id=team_id,
+            slack_channel_id=slack_channel_id
+        ).first()
+        
+        if not slack_session:
+            await slack_bot.send_message(
+                channel=channel_id,
+                text="Error: No active session in this channel. Use `/sr-session create` first.",
+                ephemeral_user=user_id
+            )
+            return
+        
+        actual_session_id = slack_session.session_id
+        
+        # Create pending response using DM review system
+        from llm_utils import create_pending_response
+        response_id = create_pending_response(
+            session_id=actual_session_id,
+            user_id=user_id,
+            context=message,
+            response_type='slack_ai',
+            priority=2
+        )
+        
+        # Notify in Slack
+        await slack_bot.send_message(
+            channel=channel_id,
+            blocks=slack_bot.format_shadowrun_response(
+                f"AI request submitted for DM review.\nRequest ID: {response_id[:8]}...\n" \
+                f"You'll be notified when the DM approves the response.",
+                "success"
+            )
+        )
+        
+    except Exception as e:
+        print(f"Error processing Slack AI request: {e}")
+        await slack_bot.send_message(
+            channel=channel_id,
+            text=f"Error processing AI request: {str(e)}",
+            ephemeral_user=user_id
+        )
+
+async def process_slack_image_request(session_id: str, user_id: str, description: str, channel_id: str):
+    """Process image generation request from Slack"""
+    try:
+        # Get actual session ID from Slack session
+        team_id, slack_channel_id = session_id.split('_', 1)
+        slack_session = SlackSession.query.filter_by(
+            slack_team_id=team_id,
+            slack_channel_id=slack_channel_id
+        ).first()
+        
+        if not slack_session:
+            await slack_bot.send_message(
+                channel=channel_id,
+                text="Error: No active session in this channel. Use `/sr-session create` first.",
+                ephemeral_user=user_id
+            )
+            return
+        
+        actual_session_id = slack_session.session_id
+        
+        # Generate image directly
+        from image_gen_utils import ImageGenerator
+        generator = ImageGenerator()
+        
+        result = await generator.generate_image(
+            prompt=description,
+            provider="dalle",  # Default to DALL-E
+            context=f"Slack Session: {actual_session_id}"
+        )
+        
+        # Save to database
+        generated_image = GeneratedImage(
+            session_id=actual_session_id,
+            user_id=user_id,
+            prompt=description,
+            enhanced_prompt=result.get("revised_prompt", description),
+            image_url=result["image_url"],
+            provider=result["provider"],
+            status="completed",
+            generation_time=result["generation_time"],
+            completed_at=datetime.utcnow()
+        )
+        
+        db.session.add(generated_image)
+        db.session.commit()
+        
+        # Share image in Slack
+        await slack_bot.upload_image(
+            channel=channel_id,
+            image_url=result["image_url"],
+            title=f"Generated Scene: {description[:50]}...",
+            comment=f"Generated by <@{user_id}> using {result['provider'].upper()}\n" \
+                   f"Generation time: {result['generation_time']:.1f}s"
+        )
+        
+    except Exception as e:
+        print(f"Error processing Slack image request: {e}")
+        await slack_bot.send_message(
+            channel=channel_id,
+            blocks=slack_bot.format_shadowrun_response(
+                f"Image generation failed: {str(e)}",
+                "error"
+            )
+        )
+
+async def handle_app_mention(event: Dict):
+    """Handle when the bot is mentioned in Slack"""
+    try:
+        channel = event.get('channel')
+        user = event.get('user')
+        text = event.get('text', '')
+        
+        # Extract command from mention
+        # Remove bot mention and process as help
+        await slack_bot.send_message(
+            channel=channel,
+            blocks=slack_bot.format_shadowrun_response(
+                "Hello! I'm your Shadowrun assistant.\n" \
+                "Use `/sr-help` to see available commands.",
+                "general"
+            )
+        )
+        
+    except Exception as e:
+        print(f"Error handling app mention: {e}")
+
+async def notify_slack_on_dm_review(session_id: str, response_id: str, action: str, final_response: str):
+    """Notify Slack channel when DM reviews a response"""
+    try:
+        # Find Slack channel for this session
+        slack_session = SlackSession.query.filter_by(session_id=session_id).first()
+        if not slack_session:
+            return
+        
+        # Get the pending response to find the original user
+        pending_response = PendingResponse.query.get(response_id)
+        if not pending_response:
+            return
+        
+        if action == 'approved':
+            message = f"✅ *AI Response Approved*\n" \
+                     f"For: <@{pending_response.user_id}>\n" \
+                     f"Response: {final_response}"
+            
+            await slack_bot.send_message(
+                channel=slack_session.slack_channel_id,
+                blocks=slack_bot.format_shadowrun_response(message, "success")
+            )
+        
+        elif action == 'rejected':
+            await slack_bot.send_message(
+                channel=slack_session.slack_channel_id,
+                text=f"❌ AI response for <@{pending_response.user_id}> was rejected by the DM.",
+                ephemeral_user=pending_response.user_id
+            )
+        
+        elif action == 'edited':
+            message = f"✏️ *AI Response (Edited by DM)*\n" \
+                     f"For: <@{pending_response.user_id}>\n" \
+                     f"Response: {final_response}"
+            
+            await slack_bot.send_message(
+                channel=slack_session.slack_channel_id,
+                blocks=slack_bot.format_shadowrun_response(message, "success")
+            )
+        
+    except Exception as e:
+        print(f"Error notifying Slack on DM review: {e}")
 
 if __name__ == '__main__':
     with app.app_context():
