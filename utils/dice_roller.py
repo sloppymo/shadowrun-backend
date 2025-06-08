@@ -4,10 +4,13 @@ No eval() usage - all parsing is done safely
 """
 import re
 import random
+import time
+import hashlib
 from typing import List, Tuple, Dict, Optional
 from dataclasses import dataclass
 from utils.validators import DiceNotationSchema
 from pydantic import ValidationError
+from utils.logger import logger, dice_roll_sampler, timed
 
 
 @dataclass
@@ -61,45 +64,85 @@ class DiceRoller:
         
         return num_dice, dice_size, modifier
     
-    def roll(self, notation: str) -> DiceRoll:
+    @timed("dice_roll_standard")
+    def roll(self, notation: str, user_id: Optional[str] = None) -> DiceRoll:
         """
         Roll dice based on notation
         
         Args:
             notation: Dice notation string (e.g., '3d6', '2d10+5')
+            user_id: Optional user ID for tracking
             
         Returns:
             DiceRoll object with results
         """
-        num_dice, dice_size, modifier = self.parse_notation(notation)
+        start_time = time.perf_counter()
         
-        # Roll the dice
-        rolls = [self.random.randint(1, dice_size) for _ in range(num_dice)]
-        total = sum(rolls) + modifier
-        
-        return DiceRoll(
-            num_dice=num_dice,
-            dice_size=dice_size,
-            modifier=modifier,
-            rolls=rolls,
-            total=total,
-            notation=notation
-        )
+        try:
+            num_dice, dice_size, modifier = self.parse_notation(notation)
+            
+            # Log dice roll attempt
+            logger.debug("DICE_ROLL_ATTEMPT",
+                        notation=notation,
+                        num_dice=num_dice,
+                        dice_size=dice_size,
+                        modifier=modifier,
+                        user_id=user_id)
+            
+            # Roll the dice
+            rolls = [self.random.randint(1, dice_size) for _ in range(num_dice)]
+            total = sum(rolls) + modifier
+            
+            result = DiceRoll(
+                num_dice=num_dice,
+                dice_size=dice_size,
+                modifier=modifier,
+                rolls=rolls,
+                total=total,
+                notation=notation
+            )
+            
+            # Log successful roll with integrity check (sample based on volume)
+            if dice_roll_sampler.should_log():
+                roll_hash = hashlib.sha256(
+                    f"{notation}-{user_id}-{rolls}-{time.time()}".encode()
+                ).hexdigest()[:8]
+                
+                logger.dice_roll(notation, result.total, user_id or "anonymous",
+                               rolls=rolls,
+                               roll_hash=roll_hash,
+                               min_possible=num_dice + modifier,
+                               max_possible=(num_dice * dice_size) + modifier)
+            
+            return result
+            
+        except Exception as e:
+            logger.error("DICE_ROLL_FAILED",
+                        exception=e,
+                        notation=notation,
+                        user_id=user_id)
+            raise
     
-    def roll_shadowrun(self, dice_pool: int, edge_used: bool = False) -> Dict:
+    @timed("dice_roll_shadowrun")
+    def roll_shadowrun(self, dice_pool: int, edge_used: bool = False, 
+                      user_id: Optional[str] = None, context: Optional[str] = None) -> Dict:
         """
         Roll Shadowrun 6e dice pool
         
         Args:
             dice_pool: Number of d6 to roll
             edge_used: Whether Edge is being used (exploding 6s)
+            user_id: Optional user ID for tracking
+            context: Optional context (e.g., "combat", "hacking")
             
         Returns:
             Dict with hits, glitch status, and individual rolls
         """
         if dice_pool < 1:
+            logger.warning("DICE_POOL_TOO_SMALL", dice_pool=dice_pool, user_id=user_id)
             raise ValueError("Dice pool must be at least 1")
         if dice_pool > 50:
+            logger.warning("DICE_POOL_TOO_LARGE", dice_pool=dice_pool, user_id=user_id)
             raise ValueError("Dice pool cannot exceed 50")
         
         rolls = []
@@ -140,7 +183,7 @@ class DiceRoller:
         glitch = ones > len(rolls) * self.SHADOWRUN_GLITCH_THRESHOLD
         critical_glitch = glitch and hits == 0
         
-        return {
+        result = {
             'dice_pool': dice_pool,
             'rolls': rolls,
             'hits': hits,
@@ -149,6 +192,30 @@ class DiceRoller:
             'critical_glitch': critical_glitch,
             'edge_used': edge_used
         }
+        
+        # Log the roll (always log Shadowrun rolls for game integrity)
+        roll_hash = hashlib.sha256(
+            f"sr-{dice_pool}-{edge_used}-{rolls}-{time.time()}".encode()
+        ).hexdigest()[:8]
+        
+        log_data = {
+            "roll_type": "shadowrun",
+            "dice_pool": dice_pool,
+            "hits": hits,
+            "ones": ones,
+            "edge_used": edge_used,
+            "roll_hash": roll_hash,
+            "context": context
+        }
+        
+        if critical_glitch:
+            logger.warning("CRITICAL_GLITCH_ROLLED", user_id=user_id, **log_data)
+        elif glitch:
+            logger.info("GLITCH_ROLLED", user_id=user_id, **log_data)
+        else:
+            logger.dice_roll(f"{dice_pool}d6", hits, user_id or "anonymous", **log_data)
+        
+        return result
     
     def roll_initiative(self, reaction: int, intuition: int, 
                        initiative_dice: int = 1, edge_used: bool = False) -> Dict:

@@ -7,8 +7,10 @@ from datetime import datetime, timedelta
 import hashlib
 import redis
 import os
-from typing import Optional, Callable
+from typing import Optional, Callable, Dict, Any
 import jwt
+import time
+from redis import Redis
 
 # Initialize Redis for rate limiting (optional, will fall back to in-memory if not available)
 try:
@@ -28,6 +30,72 @@ except:
 # JWT secret
 JWT_SECRET = os.getenv('JWT_SECRET', 'shadowrun-secret-key-change-in-production')
 
+# Rate limit configurations
+RATE_LIMITS = {
+    'dm_review': {
+        'requests': 60,  # requests per window
+        'window': 60,    # window in seconds
+        'burst': 10      # burst allowance
+    },
+    'ai_operation': {
+        'requests': 30,  # requests per window
+        'window': 60,    # window in seconds
+        'burst': 5       # burst allowance
+    },
+    'default': {
+        'requests': 100, # requests per window
+        'window': 60,    # window in seconds
+        'burst': 20      # burst allowance
+    }
+}
+
+def get_rate_limit_key(user_id: str, category: str) -> str:
+    """Generate Redis key for rate limiting"""
+    return f"rate_limit:{category}:{user_id}"
+
+def check_rate_limit(user_id: str, category: str) -> tuple[bool, Optional[int]]:
+    """Check if request is within rate limits"""
+    if not user_id:
+        return False, None
+        
+    config = RATE_LIMITS.get(category, RATE_LIMITS['default'])
+    key = get_rate_limit_key(user_id, category)
+    
+    # Get current count and window start
+    pipe = redis_client.pipeline()
+    now = int(time.time())
+    window_start = now - config['window']
+    
+    # Clean old entries and get current count
+    pipe.zremrangebyscore(key, 0, window_start)
+    pipe.zcard(key)
+    pipe.zadd(key, {str(now): now})
+    pipe.expire(key, config['window'])
+    _, count, _, _ = pipe.execute()
+    
+    # Check if within limits
+    if count > config['requests'] + config['burst']:
+        return False, None
+        
+    return True, config['window'] - (now - window_start)
+
+def rate_limited(category: str = 'default'):
+    """Rate limiting decorator"""
+    def decorator(f):
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            user_id = request.json.get('user_id') if request.is_json else request.args.get('user_id')
+            
+            allowed, retry_after = check_rate_limit(user_id, category)
+            if not allowed:
+                return jsonify({
+                    'error': 'Rate limit exceeded',
+                    'retry_after': retry_after
+                }), 429
+                
+            return f(*args, **kwargs)
+        return decorated_function
+    return decorator
 
 def auth_required(role: Optional[str] = None):
     """
@@ -73,71 +141,6 @@ def auth_required(role: Optional[str] = None):
         
         return decorated_function
     return decorator
-
-
-def rate_limited(requests: int = 10, window: int = 60):
-    """
-    Rate limiting decorator
-    
-    Args:
-        requests: Number of requests allowed
-        window: Time window in seconds
-        
-    Usage:
-        @rate_limited(requests=5, window=60)  # 5 requests per minute
-    """
-    def decorator(f: Callable) -> Callable:
-        @wraps(f)
-        def decorated_function(*args, **kwargs):
-            # Get client identifier
-            client_id = request.headers.get('X-Forwarded-For', request.remote_addr)
-            endpoint = request.endpoint
-            key = f"rate_limit:{endpoint}:{client_id}"
-            
-            current_time = datetime.utcnow()
-            
-            if REDIS_AVAILABLE:
-                # Use Redis for distributed rate limiting
-                try:
-                    current_count = redis_client.incr(key)
-                    if current_count == 1:
-                        redis_client.expire(key, window)
-                    
-                    if current_count > requests:
-                        return jsonify({
-                            'error': 'Rate limit exceeded',
-                            'retry_after': window
-                        }), 429
-                except:
-                    # Redis error, allow request but log it
-                    print(f"Redis error in rate limiting for {key}")
-            else:
-                # In-memory fallback
-                if key not in rate_limit_storage:
-                    rate_limit_storage[key] = []
-                
-                # Clean old entries
-                cutoff_time = current_time - timedelta(seconds=window)
-                rate_limit_storage[key] = [
-                    t for t in rate_limit_storage[key] 
-                    if t > cutoff_time
-                ]
-                
-                # Check rate limit
-                if len(rate_limit_storage[key]) >= requests:
-                    return jsonify({
-                        'error': 'Rate limit exceeded',
-                        'retry_after': window
-                    }), 429
-                
-                # Add current request
-                rate_limit_storage[key].append(current_time)
-            
-            return f(*args, **kwargs)
-        
-        return decorated_function
-    return decorator
-
 
 def validate_session_access():
     """
@@ -186,7 +189,6 @@ def validate_session_access():
         return decorated_function
     return decorator
 
-
 def log_api_call():
     """
     Decorator to log API calls for debugging and auditing
@@ -211,7 +213,6 @@ def log_api_call():
         return decorated_function
     return decorator
 
-
 def require_json():
     """
     Decorator to ensure request has JSON content
@@ -225,7 +226,6 @@ def require_json():
         
         return decorated_function
     return decorator
-
 
 def sanitize_output():
     """

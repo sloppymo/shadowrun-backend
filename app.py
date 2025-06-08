@@ -1,38 +1,147 @@
+"""
+Shadowrun 6E GM Dashboard - Flask Backend API
+
+This is the main Flask application that provides the backend API for the
+Shadowrun 6E GM Dashboard system. It handles:
+
+- Session and character management
+- AI response generation and review system  
+- Combat and Matrix operations
+- Character sheet integration (Google Docs, Slack)
+- Image generation with DALL-E
+- Slack bot integration
+- Real-time data synchronization
+- Comprehensive logging and monitoring
+
+The API follows RESTful conventions and provides extensive error handling,
+input validation, and security features.
+
+@author WREN AI System
+@version 2.0.0
+@since 1.0.0
+"""
+
+# Standard library imports for core functionality
 import os
 import uuid
 import asyncio
 import json
 import traceback
-from flask import Flask, request, jsonify, Response, stream_with_context
+import time
+
+# Flask framework and extensions
+from flask import Flask, request, jsonify, Response, stream_with_context, g
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy.exc import IntegrityError
+
+# External dependencies
 from dotenv import load_dotenv
 import httpx
 from datetime import datetime
 from typing import Dict, Optional
+from werkzeug.middleware.proxy_fix import ProxyFix
 
-# Import local modules
+# Local module imports - AI and content generation
 from llm_utils import call_llm, call_llm_with_review, get_reviewed_response, call_openai_stream
 from image_gen_utils import create_image_generation_request, process_image_generation, get_session_images
 from slack_integration import slack_bot, slack_processor
 
-# Load environment variables
+# Character sheet integration system
+from integrations.character_sheet_manager import CharacterSheetManager, IntegrationType
+
+# Logging and monitoring system
+from utils.logger import logger, timed, detect_crisis_content
+from middleware.logging_middleware import init_request_logging, log_api_call
+from utils.decorators import auth_required, rate_limited, validate_session_access
+
+"""
+Application Configuration and Initialization
+"""
+
+# Load environment variables from .env file
 env_path = os.path.join(os.path.dirname(__file__), '.env')
 if os.path.exists(env_path):
     load_dotenv(env_path)
 
+# Initialize Flask application
 app = Flask(__name__)
+
+# Enable Cross-Origin Resource Sharing for frontend integration
 CORS(app)
 
-# Configure SQLite
+"""
+Security Configuration
+"""
+
+@app.after_request
+def add_security_headers(response):
+    """
+    Add comprehensive security headers to all HTTP responses
+    
+    Implements security best practices including:
+    - HSTS for HTTPS enforcement
+    - Content type sniffing protection
+    - Clickjacking protection
+    - XSS protection
+    - Content Security Policy
+    - Referrer policy
+    - Permissions policy for sensitive APIs
+    
+    @param response: Flask response object
+    @returns: Modified response with security headers
+    """
+    response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['X-XSS-Protection'] = '1; mode=block'
+    response.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline';"
+    response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
+    response.headers['Permissions-Policy'] = 'geolocation=(), microphone=(), camera=()'
+    return response
+
+# Configure proxy handling for proper IP address detection behind load balancers
+app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
+
+"""
+Database Configuration
+"""
+
+# Configure SQLite database (default for development)
 db_path = os.path.join(os.path.dirname(__file__), 'shadowrun.db')
 app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{db_path}'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+# Initialize SQLAlchemy ORM
 db = SQLAlchemy(app)
 
-# --- Models ---
+# Initialize logging middleware
+init_request_logging(app)
+
+# Log application configuration
+logger.info("APPLICATION_CONFIGURED",
+           database=db_path,
+           environment=os.getenv('FLASK_ENV', 'production'),
+           debug_mode=app.debug)
+
+"""
+Database Models
+
+SQLAlchemy ORM models for the Shadowrun GM Dashboard system.
+Each model represents a database table with defined relationships
+and constraints for data integrity.
+"""
+
 class ChatMemory(db.Model):
+    """
+    Chat Memory Model
+    
+    Stores conversation history for AI context in each session.
+    Maintains separate memory streams for different users and roles
+    to provide personalized AI responses.
+    
+    @table chat_memory
+    """
     id = db.Column(db.Integer, primary_key=True)
     session_id = db.Column(db.String, db.ForeignKey('session.id'), nullable=False)
     user_id = db.Column(db.String, nullable=False)
@@ -40,57 +149,118 @@ class ChatMemory(db.Model):
     messages = db.Column(db.Text, nullable=False, default="[]")  # JSON-encoded list of {role, content}
 
 class Session(db.Model):
+    """
+    Session Model
+    
+    Represents a Shadowrun campaign session with GM and player participants.
+    Each session maintains its own isolated game state, characters, and narrative.
+    
+    @table session
+    """
     id = db.Column(db.String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    name = db.Column(db.String, nullable=False)
-    gm_user_id = db.Column(db.String, nullable=False)
+    name = db.Column(db.String, nullable=False)  # Campaign/session name
+    gm_user_id = db.Column(db.String, nullable=False)  # Game Master's user ID
     created_at = db.Column(db.DateTime, server_default=db.func.now())
 
 class UserRole(db.Model):
+    """
+    User Role Model
+    
+    Defines user permissions and roles within each session.
+    Supports multiple role types for flexible campaign management.
+    
+    @table user_role
+    """
     id = db.Column(db.Integer, primary_key=True)
     session_id = db.Column(db.String, db.ForeignKey('session.id'), nullable=False)
-    user_id = db.Column(db.String, nullable=False)
+    user_id = db.Column(db.String, nullable=False)  # User identifier
     role = db.Column(db.String, nullable=False)  # 'player', 'gm', 'observer'
 
 class Scene(db.Model):
+    """
+    Scene Model
+    
+    Stores the current narrative scene state for each session.
+    Maintains scene descriptions and environmental context for AI responses.
+    
+    @table scene
+    """
     id = db.Column(db.Integer, primary_key=True)
     session_id = db.Column(db.String, db.ForeignKey('session.id'), nullable=False, unique=True)
-    summary = db.Column(db.Text, nullable=False, default="")
+    summary = db.Column(db.Text, nullable=False, default="")  # Current scene description
 
 class Entity(db.Model):
+    """
+    Entity Model
+    
+    Generic entity system for NPCs, spirits, drones, and other game objects.
+    Provides flexible data storage through JSON extra_data field.
+    
+    @table entity
+    """
     id = db.Column(db.Integer, primary_key=True)
     session_id = db.Column(db.String, db.ForeignKey('session.id'), nullable=False)
-    name = db.Column(db.String, nullable=False)
-    type = db.Column(db.String, nullable=False)  # e.g., 'player', 'npc', 'spirit', etc.
-    status = db.Column(db.String, nullable=True)  # e.g., 'active', 'marked', etc.
+    name = db.Column(db.String, nullable=False)  # Entity display name
+    type = db.Column(db.String, nullable=False)  # e.g., 'player', 'npc', 'spirit', 'drone'
+    status = db.Column(db.String, nullable=True)  # e.g., 'active', 'marked', 'unconscious'
     extra_data = db.Column(db.Text, nullable=True)  # JSON-encoded string for extensibility
 
-# --- Character Model for SR6E ---
 class Character(db.Model):
+    """
+    Character Model - Shadowrun 6th Edition
+    
+    Comprehensive character sheet storage for Shadowrun 6E characters.
+    Supports all character creation methods (Priority, Karma, Narrative) and
+    stores both mechanical stats and narrative elements for rich roleplay.
+    
+    JSON Fields:
+    - attributes: {body, agility, reaction, logic, intuition, willpower, charisma, edge}
+    - skills: {skill_name: rating, specialization: bonus, ...}
+    - qualities: {positive: [...], negative: [...], symbolic: [...]}
+    - gear: [{name, category, rating, availability, cost, description}, ...]
+    - lifestyle: {type, cost, months_paid, location, contacts, description}
+    - contacts: [{name, connection, loyalty, archetype, description}, ...]
+    - narrative_hooks: [{type, description, mechanical_trigger}, ...]
+    - core_traumas: [{label, description, mechanical_effect}, ...]
+    - core_strengths: [{label, description, mechanical_effect}, ...]
+    
+    @table character
+    """
     id = db.Column(db.Integer, primary_key=True)
     session_id = db.Column(db.String, db.ForeignKey('session.id'), nullable=False)
-    user_id = db.Column(db.String, nullable=False)
-    name = db.Column(db.String, nullable=False)
-    handle = db.Column(db.String, nullable=True)
-    archetype = db.Column(db.String, nullable=True)
-    background_seed = db.Column(db.String, nullable=True)
-    gender = db.Column(db.String, nullable=True)
-    pronouns = db.Column(db.String, nullable=True)
-    essence_anchor = db.Column(db.String, nullable=True)
+    user_id = db.Column(db.String, nullable=False)  # Player's user ID
+    name = db.Column(db.String, nullable=False)  # Character's real name
+    handle = db.Column(db.String, nullable=True)  # Street name/alias
+    archetype = db.Column(db.String, nullable=True)  # Street Samurai, Decker, Mage, etc.
+    background_seed = db.Column(db.String, nullable=True)  # Character background prompt
+    gender = db.Column(db.String, nullable=True)  # Character gender identity
+    pronouns = db.Column(db.String, nullable=True)  # Preferred pronouns
+    essence_anchor = db.Column(db.String, nullable=True)  # What keeps them human
     build_method = db.Column(db.String, nullable=True)  # 'priority', 'karma', 'narrative'
-    attributes = db.Column(db.Text, nullable=True)  # JSON: {body, agility, reaction, logic, intuition, willpower, charisma, edge}
-    skills = db.Column(db.Text, nullable=True)  # JSON: {skill_name: value, ...}
-    qualities = db.Column(db.Text, nullable=True)  # JSON: {positive: [...], negative: [...], symbolic: [...]}
-    gear = db.Column(db.Text, nullable=True)  # JSON: list of gear/cyberware
-    lifestyle = db.Column(db.Text, nullable=True)  # JSON: lifestyle info
-    contacts = db.Column(db.Text, nullable=True)  # JSON: list of contacts
-    narrative_hooks = db.Column(db.Text, nullable=True)  # JSON: list of hooks/flags
-    core_traumas = db.Column(db.Text, nullable=True)  # JSON: [{label, description, mechanical_effect}]
-    core_strengths = db.Column(db.Text, nullable=True)  # JSON: [{label, description, mechanical_effect}]
+    attributes = db.Column(db.Text, nullable=True)  # JSON: SR6E attributes
+    skills = db.Column(db.Text, nullable=True)  # JSON: Skills and specializations
+    qualities = db.Column(db.Text, nullable=True)  # JSON: Positive/negative/symbolic qualities
+    gear = db.Column(db.Text, nullable=True)  # JSON: Equipment and cyberware
+    lifestyle = db.Column(db.Text, nullable=True)  # JSON: Living situation and contacts
+    contacts = db.Column(db.Text, nullable=True)  # JSON: Network connections
+    narrative_hooks = db.Column(db.Text, nullable=True)  # JSON: Story hooks and flags
+    core_traumas = db.Column(db.Text, nullable=True)  # JSON: Psychological wounds
+    core_strengths = db.Column(db.Text, nullable=True)  # JSON: Character strengths
     created_at = db.Column(db.DateTime, server_default=db.func.now())
 
-# --- DM Review System Models ---
 class PendingResponse(db.Model):
-    """Stores AI-generated responses awaiting DM review"""
+    """
+    Pending Response Model - DM Review System
+    
+    Stores AI-generated responses that require Game Master review before
+    being delivered to players. Supports priority-based review queues
+    and comprehensive audit trails.
+    
+    Status Flow: pending -> approved/rejected/edited -> delivered
+    Priority Levels: 1=low, 2=medium, 3=high (combat/critical situations)
+    
+    @table pending_response
+    """
     id = db.Column(db.String, primary_key=True, default=lambda: str(uuid.uuid4()))
     session_id = db.Column(db.String, db.ForeignKey('session.id'), nullable=False)
     user_id = db.Column(db.String, nullable=False)  # Player who triggered the AI response
@@ -105,29 +275,52 @@ class PendingResponse(db.Model):
     priority = db.Column(db.Integer, nullable=False, default=1)  # 1=low, 2=medium, 3=high
 
 class DmNotification(db.Model):
-    """Notifications for DMs about pending reviews"""
+    """
+    DM Notification Model
+    
+    Real-time notification system for Game Masters about pending reviews.
+    Supports different notification types for prioritized attention.
+    
+    @table dm_notification
+    """
     id = db.Column(db.Integer, primary_key=True)
     session_id = db.Column(db.String, db.ForeignKey('session.id'), nullable=False)
-    dm_user_id = db.Column(db.String, nullable=False)
+    dm_user_id = db.Column(db.String, nullable=False)  # Game Master's user ID
     pending_response_id = db.Column(db.String, db.ForeignKey('pending_response.id'), nullable=False)
     notification_type = db.Column(db.String, nullable=False)  # 'new_review', 'urgent_review'
-    message = db.Column(db.String, nullable=False)
+    message = db.Column(db.String, nullable=False)  # Notification message text
     is_read = db.Column(db.Boolean, nullable=False, default=False)
     created_at = db.Column(db.DateTime, server_default=db.func.now())
 
 class ReviewHistory(db.Model):
-    """Audit trail of DM review actions"""
+    """
+    Review History Model
+    
+    Comprehensive audit trail of all DM review actions.
+    Tracks original responses, edits, and decision rationale
+    for campaign analysis and AI training.
+    
+    @table review_history
+    """
     id = db.Column(db.Integer, primary_key=True)
     pending_response_id = db.Column(db.String, db.ForeignKey('pending_response.id'), nullable=False)
-    dm_user_id = db.Column(db.String, nullable=False)
+    dm_user_id = db.Column(db.String, nullable=False)  # Game Master who performed review
     action = db.Column(db.String, nullable=False)  # 'approved', 'rejected', 'edited'
     original_response = db.Column(db.Text, nullable=True)  # For tracking edits
-    final_response = db.Column(db.Text, nullable=True)
-    notes = db.Column(db.Text, nullable=True)
+    final_response = db.Column(db.Text, nullable=True)  # Final approved content
+    notes = db.Column(db.Text, nullable=True)  # DM's reasoning/notes
     created_at = db.Column(db.DateTime, server_default=db.func.now())
 
 class GeneratedImage(db.Model):
-    """Stores generated scene images"""
+    """
+    Generated Image Model
+    
+    Stores AI-generated scene images with metadata and status tracking.
+    Supports multiple image generation providers and comprehensive tagging
+    for campaign asset management.
+    
+    @table generated_image
+    """
     id = db.Column(db.String, primary_key=True, default=lambda: str(uuid.uuid4()))
     session_id = db.Column(db.String, db.ForeignKey('session.id'), nullable=False)
     user_id = db.Column(db.String, nullable=False)  # User who requested the image
@@ -145,10 +338,17 @@ class GeneratedImage(db.Model):
     completed_at = db.Column(db.DateTime, nullable=True)
 
 class ImageGeneration(db.Model):
-    """Tracks image generation requests and queue"""
+    """
+    Image Generation Queue Model
+    
+    Manages the image generation request queue with priority handling
+    and retry logic. Tracks generation lifecycle from request to completion.
+    
+    @table image_generation
+    """
     id = db.Column(db.String, primary_key=True, default=lambda: str(uuid.uuid4()))
     session_id = db.Column(db.String, db.ForeignKey('session.id'), nullable=False)
-    user_id = db.Column(db.String, nullable=False)
+    user_id = db.Column(db.String, nullable=False)  # Requesting user
     request_type = db.Column(db.String, nullable=False)  # 'scene', 'character', 'location', 'item'
     context = db.Column(db.Text, nullable=False)  # Scene description or context
     style_preferences = db.Column(db.Text, nullable=True)  # JSON: style settings
@@ -161,21 +361,237 @@ class ImageGeneration(db.Model):
     completed_at = db.Column(db.DateTime, nullable=True)
 
 class SlackSession(db.Model):
-    """Maps Slack channels to game sessions"""
+    """
+    Slack Session Mapping Model
+    
+    Maps Slack team/channel combinations to game sessions for
+    integrated Slack-based gameplay. Ensures unique channel mappings.
+    
+    @table slack_session
+    """
     id = db.Column(db.Integer, primary_key=True)
-    slack_team_id = db.Column(db.String, nullable=False)
-    slack_channel_id = db.Column(db.String, nullable=False)
+    slack_team_id = db.Column(db.String, nullable=False)  # Slack workspace ID
+    slack_channel_id = db.Column(db.String, nullable=False)  # Slack channel ID
     session_id = db.Column(db.String, db.ForeignKey('session.id'), nullable=False)
     created_at = db.Column(db.DateTime, server_default=db.func.now())
     
     # Ensure unique mapping per channel
     __table_args__ = (db.UniqueConstraint('slack_team_id', 'slack_channel_id'),)
 
-# --- API Endpoints ---
+class Combat(db.Model):
+    """
+    Combat Encounter Model
+    
+    Manages Shadowrun 6E combat encounters with initiative tracking,
+    round progression, and combatant management. Supports complex
+    multi-participant combat scenarios.
+    
+    Status Flow: setup -> active -> paused -> completed
+    
+    @table combat
+    """
+    id = db.Column(db.String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    session_id = db.Column(db.String, db.ForeignKey('session.id'), nullable=False)
+    name = db.Column(db.String, nullable=False)  # Combat encounter name
+    status = db.Column(db.String, nullable=False, default='setup')  # setup, active, paused, completed
+    current_round = db.Column(db.Integer, nullable=False, default=1)
+    active_combatant_index = db.Column(db.Integer, nullable=False, default=0)
+    created_at = db.Column(db.DateTime, server_default=db.func.now())
+    updated_at = db.Column(db.DateTime, onupdate=db.func.now())
 
-# --- Character Endpoints ---
+class Combatant(db.Model):
+    """
+    Combat Participant Model
+    
+    Represents individual participants in combat encounters.
+    Stores SR6E-specific attributes, condition monitors, and status effects.
+    Supports players, NPCs, spirits, drones, and other entity types.
+    
+    @table combatant
+    """
+    id = db.Column(db.String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    combat_id = db.Column(db.String, db.ForeignKey('combat.id'), nullable=False)
+    name = db.Column(db.String, nullable=False)  # Combatant display name
+    type = db.Column(db.String, nullable=False)  # player, npc, spirit, drone
+    initiative = db.Column(db.Integer, nullable=False, default=10)  # Initiative attribute
+    initiative_score = db.Column(db.Integer, nullable=False, default=0)  # Current initiative score
+    actions = db.Column(db.Integer, nullable=False, default=1)  # Available actions per turn
+    reaction = db.Column(db.Integer, nullable=False, default=5)  # Reaction attribute
+    intuition = db.Column(db.Integer, nullable=False, default=3)  # Intuition attribute
+    edge = db.Column(db.Integer, nullable=False, default=2)  # Maximum Edge
+    current_edge = db.Column(db.Integer, nullable=False, default=2)  # Current Edge points
+    physical_damage = db.Column(db.Integer, nullable=False, default=0)  # Physical damage taken
+    stun_damage = db.Column(db.Integer, nullable=False, default=0)  # Stun damage taken
+    physical_monitor = db.Column(db.Integer, nullable=False, default=10)  # Physical condition monitor
+    stun_monitor = db.Column(db.Integer, nullable=False, default=10)  # Stun condition monitor
+    status = db.Column(db.String, nullable=False, default='active')  # active, delayed, unconscious, dead
+    tags = db.Column(db.Text, nullable=True)  # JSON array of status effects
+    position = db.Column(db.Text, nullable=True)  # JSON {x, y, z} coordinates
+    created_at = db.Column(db.DateTime, server_default=db.func.now())
+
+class CombatAction(db.Model):
+    """
+    Combat Action Log Model
+    
+    Records all actions taken during combat for analysis and replay.
+    Stores dice rolls, action types, and detailed descriptions
+    for comprehensive combat logging.
+    
+    @table combat_action
+    """
+    id = db.Column(db.String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    combat_id = db.Column(db.String, db.ForeignKey('combat.id'), nullable=False)
+    combatant_id = db.Column(db.String, db.ForeignKey('combatant.id'), nullable=False)
+    round_number = db.Column(db.Integer, nullable=False)  # Combat round number
+    action_type = db.Column(db.String, nullable=False)  # attack, defense, movement, spell, matrix, other
+    description = db.Column(db.Text, nullable=False)  # Action description
+    rolls = db.Column(db.Text, nullable=True)  # JSON array of dice rolls
+    timestamp = db.Column(db.DateTime, server_default=db.func.now())
+
+class MatrixGrid(db.Model):
+    """
+    Matrix Grid Model
+    
+    Represents virtual Matrix environments where deckers operate.
+    Each grid has security ratings, noise levels, and contains
+    multiple interconnected nodes for hacking scenarios.
+    
+    @table matrix_grid
+    """
+    id = db.Column(db.String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    session_id = db.Column(db.String, db.ForeignKey('session.id'), nullable=False)
+    name = db.Column(db.String, nullable=False)  # Grid display name
+    grid_type = db.Column(db.String, nullable=False)  # public, corporate, private
+    security_rating = db.Column(db.Integer, nullable=False, default=3)  # Overall security level
+    noise_level = db.Column(db.Integer, nullable=False, default=0)  # Matrix noise modifier
+    created_at = db.Column(db.DateTime, server_default=db.func.now())
+
+class MatrixNode(db.Model):
+    """
+    Matrix Node Model
+    
+    Individual nodes within Matrix grids representing hosts, files,
+    devices, and data stores. Supports 3D positioning for visual
+    Matrix representation and complex node relationships.
+    
+    @table matrix_node
+    """
+    id = db.Column(db.String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    grid_id = db.Column(db.String, db.ForeignKey('matrix_grid.id'), nullable=False)
+    name = db.Column(db.String, nullable=False)  # Node display name
+    node_type = db.Column(db.String, nullable=False)  # host, file, device, persona, ice, data
+    security = db.Column(db.Integer, nullable=False, default=5)  # Node security rating
+    encrypted = db.Column(db.Boolean, nullable=False, default=False)  # Encryption status
+    position_x = db.Column(db.Float, nullable=False, default=0)  # 3D position X
+    position_y = db.Column(db.Float, nullable=False, default=0)  # 3D position Y
+    position_z = db.Column(db.Float, nullable=False, default=0)  # 3D position Z
+    discovered = db.Column(db.Boolean, nullable=False, default=False)  # Player discovery status
+    compromised = db.Column(db.Boolean, nullable=False, default=False)  # Hack status
+    data_payload = db.Column(db.Text, nullable=True)  # JSON data content
+    connected_nodes = db.Column(db.Text, nullable=True)  # JSON array of node IDs
+
+class MatrixPersona(db.Model):
+    """
+    Matrix Persona Model
+    
+    Represents a character's virtual presence in the Matrix.
+    Tracks ASDF attributes (Attack, Sleaze, Data Processing, Firewall),
+    overwatch scores, and Matrix positioning for hacking scenarios.
+    
+    @table matrix_persona
+    """
+    id = db.Column(db.String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    character_id = db.Column(db.String, nullable=False)  # Associated character
+    user_id = db.Column(db.String, nullable=False)  # Player user ID
+    grid_id = db.Column(db.String, db.ForeignKey('matrix_grid.id'), nullable=True)  # Current grid
+    attack = db.Column(db.Integer, nullable=False, default=4)  # Attack attribute
+    sleaze = db.Column(db.Integer, nullable=False, default=5)  # Sleaze attribute
+    data_processing = db.Column(db.Integer, nullable=False, default=6)  # Data Processing attribute
+    firewall = db.Column(db.Integer, nullable=False, default=4)  # Firewall attribute
+    matrix_damage = db.Column(db.Integer, nullable=False, default=0)  # Matrix damage taken
+    overwatch_score = db.Column(db.Integer, nullable=False, default=0)  # GOD attention level
+    is_running_silent = db.Column(db.Boolean, nullable=False, default=False)  # Stealth mode
+    is_hot_sim = db.Column(db.Boolean, nullable=False, default=False)  # Hot-sim VR mode
+    position_x = db.Column(db.Float, nullable=False, default=0)  # Matrix position X
+    position_y = db.Column(db.Float, nullable=False, default=0)  # Matrix position Y
+    position_z = db.Column(db.Float, nullable=False, default=0)  # Matrix position Z
+
+class MatrixAction(db.Model):
+    """
+    Matrix Action Log Model
+    
+    Records all Matrix actions performed by personas including
+    hacking attempts, file transfers, and system intrusions.
+    Tracks overwatch generation for GOD response mechanics.
+    
+    @table matrix_action
+    """
+    id = db.Column(db.String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    session_id = db.Column(db.String, db.ForeignKey('session.id'), nullable=False)
+    persona_id = db.Column(db.String, db.ForeignKey('matrix_persona.id'), nullable=False)
+    action_type = db.Column(db.String, nullable=False)  # hack, search, download, upload, crash, trace
+    target_node_id = db.Column(db.String, nullable=True)  # Target node (if applicable)
+    success = db.Column(db.Boolean, nullable=False)  # Action success/failure
+    rolls = db.Column(db.Text, nullable=True)  # JSON dice rolls
+    overwatch_generated = db.Column(db.Integer, nullable=False, default=0)  # Overwatch score increase
+    timestamp = db.Column(db.DateTime, server_default=db.func.now())
+
+class IceProgram(db.Model):
+    """
+    ICE Program Model
+    
+    Represents Intrusion Countermeasures Electronics (ICE) programs
+    that defend Matrix nodes from unauthorized access. Supports
+    various ICE types with autonomous behavior patterns.
+    
+    ICE Types:
+    - patrol: Roams and detects intruders
+    - probe: Investigates suspicious activity
+    - killer: Attacks detected intruders
+    - track: Traces intruder locations
+    - tar_baby: Traps and holds intruders
+    
+    @table ice_program
+    """
+    id = db.Column(db.String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    grid_id = db.Column(db.String, db.ForeignKey('matrix_grid.id'), nullable=False)
+    node_id = db.Column(db.String, db.ForeignKey('matrix_node.id'), nullable=True)  # Assigned node
+    name = db.Column(db.String, nullable=False)  # ICE program name
+    ice_type = db.Column(db.String, nullable=False)  # patrol, probe, killer, track, tar_baby
+    rating = db.Column(db.Integer, nullable=False, default=6)  # ICE program rating
+    status = db.Column(db.String, nullable=False, default='active')  # active, alerted, crashed
+    position_x = db.Column(db.Float, nullable=False, default=0)  # Matrix position X
+    position_y = db.Column(db.Float, nullable=False, default=0)  # Matrix position Y
+    position_z = db.Column(db.Float, nullable=False, default=0)  # Matrix position Z
+    last_action = db.Column(db.DateTime, nullable=True)  # Last action timestamp
+
+"""
+API Endpoints
+
+RESTful API routes for the Shadowrun GM Dashboard system.
+Organized by functional areas with comprehensive error handling,
+input validation, and detailed response formatting.
+
+Authentication: Currently uses session-based authentication
+Rate Limiting: Applied to resource-intensive endpoints
+Error Handling: Standardized JSON error responses
+"""
+
+# --- Character Management Endpoints ---
+
 @app.route('/api/session/<session_id>/characters', methods=['GET'])
 def get_characters(session_id):
+    """
+    Get All Characters in Session
+    
+    Retrieves all character sheets for a specific session.
+    Returns comprehensive character data including attributes,
+    skills, gear, and narrative elements.
+    
+    @param session_id: Session identifier
+    @return: JSON array of character objects
+    @raises 404: Session not found
+    """
     chars = Character.query.filter_by(session_id=session_id).all()
     return jsonify([
         {
@@ -205,6 +621,19 @@ def get_characters(session_id):
 
 @app.route('/api/session/<session_id>/character', methods=['POST'])
 def create_character(session_id):
+    """
+    Create New Character
+    
+    Creates a new character sheet in the specified session.
+    Supports all Shadowrun 6E character creation methods and
+    comprehensive character data storage.
+    
+    @param session_id: Session identifier
+    @body: Character data object (JSON)
+    @return: Character creation confirmation with ID
+    @raises 400: Invalid character data
+    @raises 500: Database error
+    """
     data = request.json
     try:
         char = Character(
@@ -240,6 +669,18 @@ def create_character(session_id):
 
 @app.route('/api/session/<session_id>/character/<int:char_id>', methods=['GET'])
 def get_character(session_id, char_id):
+    """
+    Get Individual Character
+    
+    Retrieves detailed character sheet data for a specific character.
+    Returns complete character information including all SR6E
+    attributes, skills, gear, and narrative elements.
+    
+    @param session_id: Session identifier
+    @param char_id: Character identifier
+    @return: Complete character data object
+    @raises 404: Character not found
+    """
     char = Character.query.filter_by(session_id=session_id, id=char_id).first()
     if not char:
         return jsonify({'status': 'error', 'error': 'Character not found'}), 404
@@ -268,6 +709,20 @@ def get_character(session_id, char_id):
 
 @app.route('/api/session/<session_id>/character/<int:char_id>', methods=['PUT'])
 def update_character(session_id, char_id):
+    """
+    Update Character Sheet
+    
+    Updates an existing character sheet with new data.
+    Supports partial updates and maintains data integrity
+    for all character fields.
+    
+    @param session_id: Session identifier
+    @param char_id: Character identifier
+    @body: Updated character data (JSON)
+    @return: Update confirmation
+    @raises 404: Character not found
+    @raises 400: Invalid update data
+    """
     char = Character.query.filter_by(session_id=session_id, id=char_id).first()
     if not char:
         return jsonify({'status': 'error', 'error': 'Character not found'}), 404
@@ -282,6 +737,18 @@ def update_character(session_id, char_id):
 
 @app.route('/api/session/<session_id>/character/<int:char_id>', methods=['DELETE'])
 def delete_character(session_id, char_id):
+    """
+    Delete Character
+    
+    Permanently removes a character from the session.
+    This action cannot be undone and will remove all
+    associated character data.
+    
+    @param session_id: Session identifier
+    @param char_id: Character identifier
+    @return: Deletion confirmation
+    @raises 404: Character not found
+    """
     char = Character.query.filter_by(session_id=session_id, id=char_id).first()
     if not char:
         return jsonify({'status': 'error', 'error': 'Character not found'}), 404
@@ -289,9 +756,19 @@ def delete_character(session_id, char_id):
     db.session.commit()
     return jsonify({'status': 'deleted'})
 
-# --- Scene Endpoints ---
+# --- Scene Management Endpoints ---
+
 @app.route('/api/session/<session_id>/scene', methods=['GET'])
 def get_scene(session_id):
+    """
+    Get Current Scene
+    
+    Retrieves the current narrative scene description for the session.
+    Returns empty summary if no scene has been set.
+    
+    @param session_id: Session identifier
+    @return: Scene data with summary
+    """
     scene = Scene.query.filter_by(session_id=session_id).first()
     if scene:
         return jsonify({'session_id': session_id, 'summary': scene.summary})
@@ -300,6 +777,18 @@ def get_scene(session_id):
 
 @app.route('/api/session/<session_id>/scene', methods=['POST'])
 def update_scene(session_id):
+    """
+    Update Scene Description
+    
+    Updates the current narrative scene for the session.
+    Only Game Masters can modify scene descriptions.
+    Creates new scene record if none exists.
+    
+    @param session_id: Session identifier
+    @body: Scene data with summary and user_id
+    @return: Updated scene data
+    @raises 403: Non-GM user attempted update
+    """
     data = request.json
     summary = data.get('summary', '')
     user_id = data.get('user_id')
@@ -316,9 +805,19 @@ def update_scene(session_id):
     db.session.commit()
     return jsonify({'session_id': session_id, 'summary': scene.summary})
 
-# --- Entity Endpoints ---
+# --- Entity Management Endpoints ---
+
 @app.route('/api/session/<session_id>/entities', methods=['GET'])
 def get_entities(session_id):
+    """
+    Get All Entities
+    
+    Retrieves all entities (NPCs, spirits, drones, etc.) in the session.
+    Returns comprehensive entity data including custom attributes.
+    
+    @param session_id: Session identifier
+    @return: Array of entity objects
+    """
     entities = Entity.query.filter_by(session_id=session_id).all()
     return jsonify([
         {'id': e.id, 'name': e.name, 'type': e.type, 'status': e.status, 'extra_data': e.extra_data}
@@ -327,6 +826,19 @@ def get_entities(session_id):
 
 @app.route('/api/session/<session_id>/entities', methods=['POST'])
 def add_or_update_entity(session_id):
+    """
+    Create or Update Entity
+    
+    Creates a new entity or updates an existing one.
+    Supports NPCs, spirits, drones, and other game objects.
+    Only Game Masters can modify entities.
+    
+    @param session_id: Session identifier
+    @body: Entity data (name, type, status, extra_data, optional id)
+    @return: Entity data with ID
+    @raises 403: Non-GM user attempted modification
+    @raises 404: Entity not found for update
+    """
     data = request.json
     user_id = data.get('user_id')
     # Permission check: only GM can add/update
@@ -358,6 +870,19 @@ def add_or_update_entity(session_id):
 
 @app.route('/api/session/<session_id>/entities/<int:entity_id>', methods=['DELETE'])
 def delete_entity(session_id, entity_id):
+    """
+    Delete Entity
+    
+    Permanently removes an entity from the session.
+    Only Game Masters can delete entities.
+    
+    @param session_id: Session identifier
+    @param entity_id: Entity identifier
+    @body: User authentication data
+    @return: Deletion confirmation
+    @raises 403: Non-GM user attempted deletion
+    @raises 404: Entity not found
+    """
     data = request.json
     user_id = data.get('user_id')
     # Permission check: only GM can delete
@@ -371,11 +896,23 @@ def delete_entity(session_id, entity_id):
     db.session.commit()
     return jsonify({'status': 'deleted'})
 
-# --- DM Review System API Endpoints ---
+# --- DM Review System Endpoints ---
 
 @app.route('/api/session/<session_id>/pending-responses', methods=['GET'])
 def get_pending_responses(session_id):
-    """Get all pending responses for a session (DMs only)"""
+    """
+    Get Pending AI Responses
+    
+    Retrieves all AI-generated responses awaiting Game Master review.
+    Responses are sorted by priority (high to low) then by creation time.
+    Only Game Masters can access pending responses.
+    
+    @param session_id: Session identifier
+    @query user_id: Game Master's user ID for authentication
+    @return: Array of pending response objects
+    @raises 400: Missing user_id parameter
+    @raises 403: Non-GM user attempted access
+    """
     user_id = request.args.get('user_id')
     if not user_id:
         return jsonify({'error': 'user_id is required'}), 400
@@ -595,16 +1132,80 @@ def ping():
     return jsonify({'status': 'ok', 'message': 'Shadowrun backend is alive.'})
 
 @app.route('/api/session', methods=['POST'])
+@timed("create_session")
 def create_session():
+    """Create a new game session with comprehensive logging"""
+    logger.debug("CREATE_SESSION_STARTED")
+    
+    # Parse request data
+    parse_start = time.perf_counter()
     data = request.json
+    logger.debug("REQUEST_DATA_PARSED", 
+                data_keys=list(data.keys()) if data else [],
+                parse_time_ms=(time.perf_counter() - parse_start) * 1000)
+    
+    # Validate required fields
     name = data.get('name')
     gm_user_id = data.get('gm_user_id')
+    
     if not name or not gm_user_id:
+        logger.warning("SESSION_CREATION_FAILED", 
+                      reason="missing_fields",
+                      has_name=bool(name),
+                      has_gm_id=bool(gm_user_id))
         return jsonify({'error': 'Missing required fields'}), 400
-    session = Session(name=name, gm_user_id=gm_user_id)
-    db.session.add(session)
-    db.session.commit()
-    return jsonify({'session_id': session.id, 'name': session.name, 'gm_user_id': session.gm_user_id})
+    
+    # Create session
+    db_start = time.perf_counter()
+    try:
+        session = Session(
+            id=str(uuid.uuid4()),
+            name=name, 
+            gm_user_id=gm_user_id
+        )
+        
+        logger.debug("SESSION_OBJECT_CREATED",
+                    session_id=session.id,
+                    session_name=session.name,
+                    gm_id=session.gm_user_id)
+        
+        db.session.add(session)
+        db.session.commit()
+        
+        db_time = (time.perf_counter() - db_start) * 1000
+        
+        logger.info("SESSION_CREATED",
+                   session_id=session.id,
+                   session_name=session.name,
+                   gm_user_id=session.gm_user_id,
+                   db_time_ms=round(db_time, 2))
+        
+        # Log game event
+        logger.game_event("NEW_SESSION",
+                         session_id=session.id,
+                         session_name=session.name,
+                         gm_user_id=session.gm_user_id)
+        
+        return jsonify({
+            'session_id': session.id,
+            'name': session.name,
+            'gm_user_id': session.gm_user_id
+        })
+        
+    except IntegrityError as e:
+        db.session.rollback()
+        logger.error("SESSION_CREATION_DB_ERROR", 
+                    exception=e,
+                    name=name,
+                    gm_user_id=gm_user_id)
+        return jsonify({'error': str(e)}), 400
+    except Exception as e:
+        db.session.rollback()
+        logger.error("SESSION_CREATION_UNEXPECTED_ERROR",
+                    exception=e,
+                    name=name,
+                    gm_user_id=gm_user_id)
+        return jsonify({'error': 'Failed to create session'}), 500
 
 @app.route('/api/session/<session_id>/join', methods=['POST'])
 def join_session(session_id):
@@ -1007,6 +1608,13 @@ def index():
 from stream_proxy import stream_proxy
 app.register_blueprint(stream_proxy)
 
+# Register combat and matrix blueprints
+# TODO: Fix circular import issue
+# from routes.combat import combat_bp
+# from routes.matrix import matrix_bp
+# app.register_blueprint(combat_bp)
+# app.register_blueprint(matrix_bp)
+
 # --- Slack Integration Endpoints ---
 @app.route('/api/slack/command', methods=['POST'])
 def handle_slack_command():
@@ -1332,6 +1940,272 @@ async def notify_slack_on_dm_review(session_id: str, response_id: str, action: s
         
     except Exception as e:
         print(f"Error notifying Slack on DM review: {e}")
+
+# --- Character Sheet Integration Endpoints ---
+
+# Initialize character sheet manager globally
+character_sheet_manager = None
+
+def get_character_sheet_manager():
+    """Get or create character sheet manager instance"""
+    global character_sheet_manager
+    if character_sheet_manager is None:
+        character_sheet_manager = CharacterSheetManager(db.session)
+    return character_sheet_manager
+
+@app.route('/api/session/<session_id>/character-sheets/discover', methods=['GET'])
+def discover_character_sheets(session_id):
+    """Discover character sheets across all platforms"""
+    try:
+        user_id = request.args.get('user_id')
+        
+        # Validate session
+        session = Session.query.filter_by(id=session_id).first()
+        if not session:
+            return jsonify({'error': 'Invalid session_id'}), 400
+        
+        manager = get_character_sheet_manager()
+        sheets = asyncio.run(manager.discover_character_sheets(session_id, user_id))
+        
+        return jsonify({
+            'status': 'success',
+            'session_id': session_id,
+            'discovered_sheets': sheets
+        })
+        
+    except Exception as e:
+        logger.error(f"Error discovering character sheets: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/session/<session_id>/character-sheets/import', methods=['POST'])
+def import_character_sheet(session_id):
+    """Import character sheet from external source"""
+    try:
+        data = request.json
+        user_id = data.get('user_id')
+        source_type = data.get('source_type')  # 'google_docs' or 'slack'
+        source_reference = data.get('source_reference')
+        
+        if not user_id or not source_type or not source_reference:
+            return jsonify({'error': 'Missing required fields'}), 400
+        
+        # Validate session and user
+        session = Session.query.filter_by(id=session_id).first()
+        if not session:
+            return jsonify({'error': 'Invalid session_id'}), 400
+        
+        user_role = UserRole.query.filter_by(session_id=session_id, user_id=user_id).first()
+        if not user_role:
+            return jsonify({'error': 'User not in session'}), 403
+        
+        manager = get_character_sheet_manager()
+        result = asyncio.run(manager.import_character_sheet(
+            session_id, user_id, source_type, source_reference
+        ))
+        
+        return jsonify(result)
+        
+    except Exception as e:
+        logger.error(f"Error importing character sheet: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/session/<session_id>/character/<int:character_id>/update', methods=['POST'])
+def update_character_sheet_integrated(session_id, character_id):
+    """Update character sheet with external sync"""
+    try:
+        data = request.json
+        user_id = data.get('user_id')
+        updates = data.get('updates', {})
+        sync_to_external = data.get('sync_to_external', True)
+        
+        if not user_id:
+            return jsonify({'error': 'Missing user_id'}), 400
+        
+        # Validate permissions
+        character = Character.query.filter_by(id=character_id, session_id=session_id).first()
+        if not character:
+            return jsonify({'error': 'Character not found'}), 404
+        
+        # Check if user owns character or is GM
+        session = Session.query.filter_by(id=session_id).first()
+        if character.user_id != user_id and session.gm_user_id != user_id:
+            return jsonify({'error': 'Permission denied'}), 403
+        
+        manager = get_character_sheet_manager()
+        result = asyncio.run(manager.update_character_sheet(
+            character_id, updates, sync_to_external
+        ))
+        
+        return jsonify(result)
+        
+    except Exception as e:
+        logger.error(f"Error updating character sheet: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/session/<session_id>/character/<int:character_id>/create-wren-copy', methods=['POST'])
+def create_wren_managed_copy(session_id, character_id):
+    """Create WREN-managed copies of character sheet"""
+    try:
+        data = request.json
+        user_id = data.get('user_id')
+        
+        if not user_id:
+            return jsonify({'error': 'Missing user_id'}), 400
+        
+        # Validate permissions (only GM or character owner)
+        character = Character.query.filter_by(id=character_id, session_id=session_id).first()
+        if not character:
+            return jsonify({'error': 'Character not found'}), 404
+        
+        session = Session.query.filter_by(id=session_id).first()
+        if character.user_id != user_id and session.gm_user_id != user_id:
+            return jsonify({'error': 'Permission denied'}), 403
+        
+        manager = get_character_sheet_manager()
+        result = asyncio.run(manager.create_wren_managed_copy(character_id))
+        
+        return jsonify(result)
+        
+    except Exception as e:
+        logger.error(f"Error creating WREN managed copy: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/session/<session_id>/character-sheets/sync-all', methods=['POST'])
+def sync_all_character_sheets(session_id):
+    """Sync all character sheets for a session"""
+    try:
+        data = request.json
+        user_id = data.get('user_id')
+        
+        if not user_id:
+            return jsonify({'error': 'Missing user_id'}), 400
+        
+        # Validate GM permissions
+        session = Session.query.filter_by(id=session_id).first()
+        if not session or session.gm_user_id != user_id:
+            return jsonify({'error': 'Only GMs can sync all character sheets'}), 403
+        
+        manager = get_character_sheet_manager()
+        result = asyncio.run(manager.sync_all_character_sheets(session_id))
+        
+        return jsonify(result)
+        
+    except Exception as e:
+        logger.error(f"Error syncing all character sheets: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/character-sheet/integration-status', methods=['GET'])
+def get_integration_status():
+    """Get status of character sheet integrations"""
+    try:
+        manager = get_character_sheet_manager()
+        status = manager.get_integration_status()
+        
+        return jsonify({
+            'status': 'success',
+            'integrations': status
+        })
+        
+    except Exception as e:
+        logger.error(f"Error getting integration status: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/session/<session_id>/character/<int:character_id>/integration-info', methods=['GET'])
+def get_character_integration_info(session_id, character_id):
+    """Get integration information for a specific character"""
+    try:
+        user_id = request.args.get('user_id')
+        
+        if not user_id:
+            return jsonify({'error': 'Missing user_id'}), 400
+        
+        # Validate permissions
+        character = Character.query.filter_by(id=character_id, session_id=session_id).first()
+        if not character:
+            return jsonify({'error': 'Character not found'}), 404
+        
+        session = Session.query.filter_by(id=session_id).first()
+        user_role = UserRole.query.filter_by(session_id=session_id, user_id=user_id).first()
+        
+        if not user_role:
+            return jsonify({'error': 'User not in session'}), 403
+        
+        manager = get_character_sheet_manager()
+        info = asyncio.run(manager.get_character_integration_info(character_id))
+        
+        return jsonify(info)
+        
+    except Exception as e:
+        logger.error(f"Error getting character integration info: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/session/<session_id>/character-sheets/google-docs/authorize', methods=['POST'])
+def authorize_google_docs(session_id):
+    """Start Google Docs authorization flow"""
+    try:
+        data = request.json
+        user_id = data.get('user_id')
+        
+        if not user_id:
+            return jsonify({'error': 'Missing user_id'}), 400
+        
+        # This would implement OAuth2 flow for Google Docs
+        # For now, return instructions
+        return jsonify({
+            'status': 'info',
+            'message': 'Google Docs integration requires OAuth2 setup',
+            'instructions': [
+                '1. Set up Google Cloud Project with Docs API enabled',
+                '2. Download credentials.json file',
+                '3. Place in shadowrun-backend directory',
+                '4. Run authorization flow'
+            ],
+            'authorization_url': 'Please follow Google Docs API setup guide'
+        })
+        
+    except Exception as e:
+        logger.error(f"Error with Google Docs authorization: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/session/<session_id>/character-sheets/slack/configure', methods=['POST'])
+def configure_slack_integration(session_id):
+    """Configure Slack integration for character sheets"""
+    try:
+        data = request.json
+        user_id = data.get('user_id')
+        channel_id = data.get('channel_id')
+        
+        if not user_id or not channel_id:
+            return jsonify({'error': 'Missing required fields'}), 400
+        
+        # Validate GM permissions
+        session = Session.query.filter_by(id=session_id).first()
+        if not session or session.gm_user_id != user_id:
+            return jsonify({'error': 'Only GMs can configure Slack integration'}), 403
+        
+        # Create or update Slack session mapping
+        slack_session = SlackSession.query.filter_by(session_id=session_id).first()
+        if not slack_session:
+            slack_session = SlackSession(
+                slack_team_id='unknown',  # Would be filled by actual Slack integration
+                slack_channel_id=channel_id,
+                session_id=session_id
+            )
+            db.session.add(slack_session)
+        else:
+            slack_session.slack_channel_id = channel_id
+        
+        db.session.commit()
+        
+        return jsonify({
+            'status': 'success',
+            'message': 'Slack integration configured',
+            'channel_id': channel_id
+        })
+        
+    except Exception as e:
+        logger.error(f"Error configuring Slack integration: {e}")
+        return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
     with app.app_context():

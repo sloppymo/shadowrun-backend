@@ -3,10 +3,12 @@ Test AI input validation and security measures
 """
 import pytest
 import asyncio
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, AsyncMock
 from utils.validators import AIInputSchema, BLOCKED_AI_PATTERNS
 from pydantic import ValidationError
 import json
+import os
+from dotenv import load_dotenv
 
 
 class TestAIInputValidation:
@@ -293,3 +295,140 @@ class TestAIEmotionalTriggers:
             # These would need specific patterns added to BLOCKED_AI_PATTERNS
             # to be blocked in production
             pass 
+
+
+class TestOpenAIIntegration:
+    """Test OpenAI API integration and key handling"""
+    
+    @pytest.fixture(autouse=True)
+    def setup_env(self):
+        """Setup test environment variables"""
+        # Save original env vars
+        self.original_key = os.getenv("OPENAI_API_KEY")
+        # Set test key
+        os.environ["OPENAI_API_KEY"] = "test-key-123"
+        yield
+        # Restore original env vars
+        if self.original_key:
+            os.environ["OPENAI_API_KEY"] = self.original_key
+        else:
+            del os.environ["OPENAI_API_KEY"]
+    
+    @pytest.fixture
+    def mock_openai_response(self):
+        """Mock OpenAI API response"""
+        return {
+            "choices": [{
+                "message": {
+                    "content": "This is a test response from the AI."
+                }
+            }]
+        }
+    
+    @pytest.fixture
+    def mock_openai_stream(self):
+        """Mock OpenAI streaming response"""
+        async def mock_stream():
+            chunks = [
+                {"choices": [{"delta": {"content": "This "}}]},
+                {"choices": [{"delta": {"content": "is "}}]},
+                {"choices": [{"delta": {"content": "a "}}]},
+                {"choices": [{"delta": {"content": "test."}}]}
+            ]
+            for chunk in chunks:
+                yield json.dumps(chunk)
+        return mock_stream
+    
+    def test_api_key_loading(self):
+        """Test that API key is properly loaded from environment"""
+        from llm_utils import OPENAI_API_KEY
+        assert OPENAI_API_KEY == "test-key-123"
+    
+    @patch('httpx.AsyncClient.post')
+    async def test_openai_api_call(self, mock_post, mock_openai_response):
+        """Test successful OpenAI API call"""
+        from llm_utils import call_openai
+        
+        # Setup mock
+        mock_response = MagicMock()
+        mock_response.json.return_value = mock_openai_response
+        mock_response.raise_for_status = MagicMock()
+        mock_post.return_value = mock_response
+        
+        # Test API call
+        messages = [{"role": "user", "content": "Test prompt"}]
+        response = await call_openai(messages)
+        
+        # Verify
+        assert response == mock_openai_response
+        mock_post.assert_called_once()
+        headers = mock_post.call_args[1]["headers"]
+        assert headers["Authorization"] == "Bearer test-key-123"
+    
+    @patch('httpx.AsyncClient.stream')
+    async def test_openai_streaming(self, mock_stream, mock_openai_stream):
+        """Test OpenAI streaming response"""
+        from llm_utils import call_openai_stream
+        
+        # Setup mock
+        mock_response = AsyncMock()
+        mock_response.aiter_lines = mock_openai_stream
+        mock_response.raise_for_status = MagicMock()
+        mock_stream.return_value.__aenter__.return_value = mock_response
+        
+        # Test streaming
+        messages = [{"role": "user", "content": "Test prompt"}]
+        content = ""
+        async for chunk in call_openai_stream(messages):
+            content += chunk
+        
+        # Verify
+        assert content == "This is a test."
+        mock_stream.assert_called_once()
+        headers = mock_stream.call_args[1]["headers"]
+        assert headers["Authorization"] == "Bearer test-key-123"
+    
+    @patch('httpx.AsyncClient.post')
+    async def test_api_error_handling(self, mock_post):
+        """Test handling of API errors"""
+        from llm_utils import call_openai
+        
+        # Setup mock to raise error
+        mock_post.side_effect = Exception("API Error")
+        
+        # Test error handling
+        messages = [{"role": "user", "content": "Test prompt"}]
+        with pytest.raises(Exception) as exc_info:
+            await call_openai(messages)
+        
+        assert "API Error" in str(exc_info.value)
+    
+    def test_missing_api_key(self):
+        """Test behavior when API key is missing"""
+        # Temporarily remove API key
+        original_key = os.environ.pop("OPENAI_API_KEY", None)
+        try:
+            from llm_utils import OPENAI_API_KEY
+            assert OPENAI_API_KEY is None
+        finally:
+            # Restore API key
+            if original_key:
+                os.environ["OPENAI_API_KEY"] = original_key
+    
+    @patch('httpx.AsyncClient.post')
+    async def test_rate_limiting(self, mock_post):
+        """Test rate limiting behavior"""
+        from llm_utils import call_openai
+        
+        # Setup mock to simulate rate limit
+        mock_response = MagicMock()
+        mock_response.status_code = 429
+        mock_response.raise_for_status.side_effect = Exception("Rate limit exceeded")
+        mock_post.return_value = mock_response
+        
+        # Test rate limit handling
+        messages = [{"role": "user", "content": "Test prompt"}]
+        with pytest.raises(Exception) as exc_info:
+            await call_openai(messages)
+        
+        assert "Rate limit exceeded" in str(exc_info.value) 
